@@ -1,0 +1,1833 @@
+
+# ==============================================================================
+# SCRIPT: Impact of Rice Variety and Inoculation on Root Microbiota (ITS)
+# AUTHOR: Léa Jobert
+# DATE: February 2026
+# ==============================================================================
+
+
+#1-Data preparation
+##1.1-Install packages
+```{r message=FALSE, warning=FALSE}
+library(dada2)
+library(phyloseq)
+library(microViz)
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(vegan)
+library(phangorn)
+library(picante)
+library(tidyverse)
+library(patchwork)
+library(vctrs)
+library(microbiomeutilities)
+library(pairwiseAdonis)
+library(pheatmap)
+library(RColorBrewer)
+library(decontam)
+library(ranacapa)
+library(multcompView)
+library(scales)
+library(DECIPHER)
+library(devtools)
+library(ggVennDiagram)
+library(openxlsx)
+library(DESeq2)
+library(ALDEx2)
+library(ggrepel)
+library(ggpubr)
+library(ggVennDiagram)
+library(phyloseq)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(RColorBrewer)
+```
+
+
+
+# 2. FILE PATHS & DIRECTORIES 
+```{r}
+# Set working directory - # Change to your directory
+base_path <- "path"
+setwd(base_path)
+
+# Create output directory for figures
+output_dir_fig_ITS <- file.path(base_path, "output_path")
+if(!dir.exists(output_dir_fig_ITS)) dir.create(output_dir_fig_ITS)
+```
+
+
+
+# 3. DATA IMPORT & PHYLOSEQ CREATION 
+```{r}
+# Set base path (modified to match your ITS folder)
+base_path <- "path"
+
+# Import raw ASV and Taxonomy data from CSV
+raw_data_path <- file.path(base_path, "input.csv")
+df_raw <- read.csv(raw_data_path, sep=";", header=TRUE, stringsAsFactors=FALSE)
+
+# Create Taxonomy Table
+tax_table_df <- df_raw[, c("ASV", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")]
+rownames(tax_table_df) <- tax_table_df$ASV
+tax_table_df$ASV <- NULL
+
+# Create ASV Table
+# Removing taxonomy columns to keep only samples
+asv_table <- df_raw[, setdiff(names(df_raw), c("taxonomy", "ASV", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))]
+rownames(asv_table) <- asv_table$ID
+asv_table$ID <- NULL
+asv_table <- t(asv_table)
+colnames(asv_table) <- df_raw$ASV
+
+# Import Metadata
+metadata_path <- file.path(base_path, "Metadata_Varieties.csv")
+metadata <- read.csv2(metadata_path)
+rownames(metadata) <- metadata$SampleID
+
+# Optional: Keep only specific columns in metadata (as per your original ITS code)
+keep_cols <- c("SampleID", "Variety", "Condition", "Group")
+metadata <- metadata[, keep_cols]
+
+# Ensure consistency between ASV table and Metadata
+common_samples <- intersect(rownames(asv_table), rownames(metadata))
+asv_table <- asv_table[common_samples, ]
+metadata <- metadata[common_samples, ]
+
+# Convert ASV table to numeric matrix
+asv_matrix <- apply(asv_table, 2, as.numeric)
+rownames(asv_matrix) <- rownames(asv_table)
+
+# Create Phyloseq Object
+psITS_raw <- phyloseq(otu_table(asv_matrix, taxa_are_rows=FALSE), 
+                  sample_data(metadata), 
+                  tax_table(as.matrix(tax_table_df)))
+```
+
+
+# 4. DATA FILTERING 
+```{r}
+
+# Remove non-fungal sequences (e.g., Viridiplantae if present in ITS assignment)
+psITS_filtered <- psITS_raw %>% subset_taxa(Kingdom != "k__Viridiplantae")
+
+# Remove NA at Kingdom and Phylum levels
+psITS_filtered <- subset_taxa(psITS_filtered, !is.na(Kingdom) & !is.na(Phylum))
+
+# Remove Mitochondria and Chloroplast contamination
+psITS_filtered <- psITS_filtered %>% 
+  subset_taxa(Family != "Mitochondria" & Class != "Chloroplast")
+
+# Final cleaning for the root dataset (excluding specific varieties or outliers if needed)
+# Example: removing "PhkarRumduol_GM" as requested
+psITS_Root <- subset_samples(psITS_filtered, Variety != "PhkarRumduol_GM")
+
+
+# Remove low-abundance taxa (Total count < 10)
+psITS_Root_10 <- phyloseq::filter_taxa(psITS_Root, function(x) sum(x) >= 10, prune = TRUE)
+
+
+# Check final objects
+psITS_Root
+psITS_Root_10
+```
+
+
+# 5. NORMALIZATION & SUBSETTING 
+```{r}
+# Rarefaction to minimum depth for diversity analyses
+psITS_Root_10_rare <- rarefy_even_depth(psITS_Root_10, rngseed = 123, 
+                                 sample.size = min(sample_sums(psITS_Root_10)), 
+                                 replace = FALSE, verbose = TRUE)
+
+# Control group subsets
+psITS_control <- subset_samples(psITS_Root, Condition == "Control")
+psITS_control_10 <- filter_taxa(psITS_control, function(x) sum(x) >= 10, prune = TRUE)
+psITS_control_10_rare <- rarefy_even_depth(psITS_control_10, rngseed = 123, 
+                                 sample.size = min(sample_sums(psITS_control_10)), replace = FALSE)
+
+# Inoculated group subsets
+psITS_inoc <- subset_samples(psITS_Root, Condition == "Inoculated")
+psITS_inoc_10 <- filter_taxa(psITS_inoc, function(x) sum(x) >= 10, prune = TRUE)
+psITS_inoc_10_rare <- rarefy_even_depth(psITS_inoc_10, rngseed = 123, 
+                                  sample.size = min(sample_sums(psITS_inoc_10)), replace = FALSE)
+```
+
+
+
+#6. SYMPTOMS IMPORT
+```{r}
+# ==============================================================================
+# 6. SYMPTOMS & SIZE IMPORT (CLEAN MERGE)
+# ==============================================================================
+
+# 1. Import CSV
+# Assumes the file is in your working directory set in Section 2
+symp_df <- read.csv("Symptoms.csv", sep = ";", header = TRUE, stringsAsFactors = FALSE)
+
+# 2. Clean and Format Data
+symp_df <- symp_df %>%
+  filter(!is.na(SampleID) & SampleID != "") %>%
+  mutate(
+    Symptoms_up = as.numeric(Symptoms_up),
+    Size        = as.numeric(Size)         # Added Size column
+  ) %>%
+  # Select only relevant columns to avoid duplicates/confusion
+  dplyr::select(SampleID, Symptoms_up, Size)
+
+# 3. Merge into Phyloseq Object
+# First, extract current metadata from the rarefied object
+curr_meta <- data.frame(sample_data(psITS_Root_10_rare))
+curr_meta$SampleID <- rownames(curr_meta)
+
+# Remove any existing Symptoms/Size columns to prevent duplicates (.x, .y)
+# We keep only the core experimental design columns
+core_cols <- c("SampleID", "Variety", "Condition", "Group")
+curr_meta_clean <- curr_meta[, colnames(curr_meta) %in% core_cols]
+
+# Join with new data
+new_metadata <- left_join(curr_meta_clean, symp_df, by = "SampleID")
+rownames(new_metadata) <- new_metadata$SampleID
+
+# 4. UPDATE THE PHYLOSEQ OBJECT (Crucial Step)
+# This ensures Fig 4B and the Correlation analysis can access the data
+sample_data(psITS_Root_10_rare) <- sample_data(new_metadata)
+
+# Verification
+message("Columns in Phyloseq Metadata:")
+print(colnames(sample_data(psITS_Root_10_rare)))
+# Should show: SampleID, Variety, Condition, Group, Symptoms_up, Size
+```
+
+
+#7. SETTING COLORS PALET
+```{r}
+
+colors_Variety <- c( "Leak" = "#7CAE00", "PhkarRumduol" = "#00BFC4", "PhkarMalis"="#FF3B0A","Russey"="#FFC000", "IR64"="#9E1FFF" )
+group_colors <- c(
+                "IR64_Control" = "#9E1FFF", "IR64_Inoculated" = "#CA85FF", 
+                "Leak_Control" = "#7CAE00", "Leak_Inoculated" = "#AFF500", 
+                "PhkarRumduol_Control" = "#00BFC4", "PhkarRumduol_Inoculated" = "#00EDF5", 
+                "PhkarMalis_Control"="#FF3B0A","PhkarMalis_Inoculated"="#FF7C5C",
+                "Russey_Control"="#FFC000","Russey_Inoculated"="#FFD65C")
+
+condition_colors <- c("Control" = "#009E73", "Inoculated" = "#D55E00")
+
+
+#palettes pour taxonomic binning
+colors_taxa <- c(
+  "#1b9e77", "#d95f02", "#38369A", "#e7298a", "#66a61e",
+  "#e6ab02", "#FF3200FF", "#666666", "#a6cee3", "#CA562CFF",
+  "#b2df8a", "#33a02c", "#C490D1", "#e31a1c", "#fdbf6f",
+  "#94B0DA", "#009392FF", "#B2182BFF", "#99CE64FF",
+  "#8dd3c7", "#F8D564FF", "#fb9a99", "#fb8072", "#80b1d3",
+  "#fdb462", "#b3de69", "#fccde5", "#d9d9d9", "#bc80bd",
+  "gray70"  # pour le groupe "Autres"
+)
+
+#pour les Venn: 
+color_venn  <- c(low = "#F2EBBBFF", high = "#7F1019")
+
+
+#🦠 🐛 🐜 🐝 🌱 🌿 🍃 🌾 🍄 📊 📈 📉 🗂️ 📑🎯 📌 🏷️ 📦 🗃🚀 ✨ 🔍 🧠 🔄 💡 🦠 🧪 📊 🚀✅ 
+
+```
+
+
+# 8. ANALYSIS & FIGURES --------------------------------------------------------
+# --- FIG 1: TAXONOMIC HEATMAP (Top 25 Species) ---
+```{r}
+# ==============================================================================
+# FIG 1: TAXONOMIC HEATMAP (Top 30 Species - Roots)
+# ==============================================================================
+library(phyloseq)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+library(ComplexHeatmap)
+library(circlize)
+library(tibble)
+
+# --- 1. Data Preparation & Name Cleaning ---
+
+# Filter Control (No IR64)
+psITS_control_sub <- subset_samples(psITS_control, Variety != "IR64")
+
+# Agglomerate to Species
+ps_species <- tax_glom(psITS_control_sub, taxrank = "Species", NArm = FALSE)
+
+# Relative Abundance
+ps_species_rel <- transform_sample_counts(ps_species, function(x) 100 * x / sum(x))
+
+# Melt
+df_melted <- psmelt(ps_species_rel)
+
+# Clean Names (Space separator + "sp." for NAs)
+df_melted <- df_melted %>%
+  mutate(
+    Species_Clean = ifelse(is.na(Species) | Species == "NA" | Species == "", "sp.", Species),
+    Genus_Species = paste(Genus, Species_Clean, sep = " ")
+  )
+
+
+# --- Data Aggregation and Global Ranking ---
+
+# 1. Calculate mean relative abundance per variety for each species
+mean_abundance_per_variety <- df_melted %>%
+  group_by(Variety, Genus_Species) %>%
+  summarise(MeanAbundance = mean(Abundance), .groups = "drop")
+
+# 2. Identify the Top 30 species based on cumulative abundance across all varieties
+# (Sum of means across the 4 varieties)
+top30_global_list <- mean_abundance_per_variety %>%
+  group_by(Genus_Species) %>%
+  summarise(TotalAbundance = sum(MeanAbundance)) %>%
+  arrange(desc(TotalAbundance)) %>%  # Sort highest to lowest
+  slice_head(n = 30)                 # Select top 30
+
+# 3. Filter dataset to keep only the Top 30 and pivot to wide format
+top30_wide <- mean_abundance_per_variety %>%
+  filter(Genus_Species %in% top30_global_list$Genus_Species) %>%
+  pivot_wider(names_from = Variety, values_from = MeanAbundance, values_fill = 0) %>%
+  # Crucial: Reorder rows to match the global ranking (Descending Total Abundance)
+  arrange(match(Genus_Species, top30_global_list$Genus_Species))
+
+# Save Excel
+excel_file <- file.path(output_dir_fig_ITS, "Table_Top30_Species_by_Variety_Root.xlsx")
+write.xlsx(top30_wide, file = excel_file)
+message("✅ Excel file saved: ", excel_file)
+
+# --- 2. Heatmap Setup ---
+
+# Convert to Matrix
+mat_root <- top30_wide %>%
+  column_to_rownames("Genus_Species") %>%
+  as.matrix()
+
+# Annotations (Varieties)
+annotation_df <- data.frame(Variety = colnames(mat_root))
+rownames(annotation_df) <- colnames(mat_root)
+
+# Ensure colors_Variety is defined in your environment
+ann_colors <- list(Variety = colors_Variety)
+
+# --- 3. Colors (Root Specific Palette) ---
+col_fun_root <- colorRamp2(
+  c(0, 0.2, 0.5, 1, 2, 3, 4, 5, 7, 10, 20),
+  c("white", "#EDF7DE", "#E4F2CF", "#D2E9AF", "#B7DC7F", "#93CA3F", "#7DB030", "#5B8023", "#44601A", "#22300D","black")
+)
+
+# --- 4. Generate Heatmap ---
+heatmap_root <- Heatmap(
+  mat_root,
+  name = "Abundance (%)",
+  
+  # Clustering
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  column_order = colnames(mat_root),
+  
+  # Hide Tree
+  show_row_dend = FALSE,
+  
+  # Cell Size (Square look)
+  width = unit(5, "cm"),
+  
+  # Annotation
+  top_annotation = HeatmapAnnotation(df = annotation_df, col = ann_colors),
+  
+  # Colors
+  col = col_fun_root,
+  
+  # Typography (Italic for Species)
+  row_names_side = "right",
+  row_names_gp = gpar(fontsize = 10, fontface = "italic"),
+  column_names_gp = gpar(fontsize = 10, fontface = "bold"),
+  
+  # Borders
+  rect_gp = gpar(col = "white", lwd = 1)
+)
+
+# --- 5. Save Figure ---
+svg_file <- file.path(output_dir_fig_ITS, "Fig1_Heatmap_Top30_Root_Final.svg")
+
+svg(svg_file, width = 7, height = 8)
+draw(heatmap_root)
+dev.off()
+
+message("✅ Final Root Heatmap saved to: ", svg_file)
+```
+# --- FIG 2A: ALPHA DIVERSITY (Richness) ---
+```{r}
+alpha_div <- estimate_richness(psITS_control_10, measures = c("Observed", "Shannon"))
+alpha_data <- cbind(as.data.frame(sample_data(psITS_control_10)), alpha_div)
+
+# Kruskal-Wallis Test
+kw_test <- kruskal.test(Observed ~ Variety, data = alpha_data)
+
+p_alpha <- ggplot(alpha_data, aes(x = Variety, y = Observed, fill = Variety)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(color = "black", size = 2, alpha = 0.5, width = 0.1) +
+  scale_fill_manual(values = colors_Variety) +
+  labs(title = "A. Observed ASV Richness (Control)", y = "Number of ASVs") +
+  annotate("text", x = 1, y = 250, 
+           label = paste("Kruskal-Wallis p =", signif(kw_test$p.value, 3)), hjust = 0) +
+  theme_minimal() + theme(axis.title.x = element_blank())
+
+ggsave(file.path(output_dir_fig_ITS, "Fig2A_Alpha_Diversity.svg"), p_alpha, width = 6, height = 4)
+```
+
+# --- FIG 2C: BETA DIVERSITY (NMDS - Control plants) ---
+```{r}
+# 1. Calculate Bray-Curtis distance and NMDS ordination
+bray_dist_ctrl <- phyloseq::distance(psITS_control_10_rare, method = "bray")
+nmds_ctrl <- ordinate(psITS_control_10_rare, method = "NMDS", distance = "bray")
+
+# 2. Run PERMANOVA to get R2 and p-value
+# Ensure metadata is formatted as a dataframe
+ctrl_metadata <- as.data.frame(as.matrix(sample_data(psITS_control_10_rare)))
+adonis_ctrl <- adonis2(bray_dist_ctrl ~ Variety, data = ctrl_metadata)
+
+# 3. Extract statistical values for the subtitle
+r2_val     <- round(adonis_ctrl$R2[1], 3)
+p_val      <- adonis_ctrl$`Pr(>F)`[1]
+stress_val <- round(nmds_ctrl$stress, 3) # Extracting stress value
+
+# 4. Generate the Plot
+p_nmds <- plot_ordination(psITS_control_10_rare, nmds_ctrl, color = "Variety") +
+  geom_point(size = 4, alpha = 0.7) +
+  stat_ellipse(aes(fill = Variety), geom = "polygon", alpha = 0.1, color = NA) +
+  scale_color_manual(values = colors_Variety) +
+  scale_fill_manual(values = colors_Variety) +
+  labs(
+    title = "C. NMDS - Bacterial Community (Control Roots)", 
+    subtitle = paste0(" | R² = ", r2_val, " | p = ", p_val, " | Stress = ", stress_val)
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(face = "italic", size = 11),
+    legend.title = element_text(face = "bold")
+  )
+
+# Display plot
+print(p_nmds)
+
+# Save figure
+
+ggsave(file.path(output_dir_fig_ITS, "Fig2C_NMDS_Control.svg"), p_nmds, width = 5, height = 3)
+```
+
+# --- FIG 2E: COMPLEMENTARY TO 2C ---
+```{r}
+# ==============================================================================
+# FIG 2E: Complementary analyses to NMDS (Distances, Dispersion, Pairwise tests)
+# ==============================================================================
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(vegan)
+library(patchwork)
+
+set.seed(123)  # reproducibility
+
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# 1) Sample metadata
+# ------------------------------------------------------------------------------
+
+meta_ctrl <- data.frame(sample_data(psITS_control_10_rare))
+
+meta_ctrl$SampleID <- rownames(meta_ctrl)
+
+meta_ctrl <- meta_ctrl %>%
+  dplyr::select(SampleID, Variety)
+
+# Ensure factor order matches color palette
+lvl <- intersect(names(colors_Variety), unique(meta_ctrl$Variety))
+meta_ctrl$Variety <- factor(meta_ctrl$Variety, levels = lvl)
+
+# ------------------------------------------------------------------------------
+# 2) Bray–Curtis distance matrix
+# ------------------------------------------------------------------------------
+otu_mat <- as.matrix(otu_table(psITS_control_10_rare))
+bray_dist <- vegdist(otu_mat, method = "bray")
+bray_mat  <- as.matrix(bray_dist)
+
+# ------------------------------------------------------------------------------
+# 3) Pairwise sample distances
+# ------------------------------------------------------------------------------
+pairs_df <- as.data.frame(t(combn(rownames(bray_mat), 2)), stringsAsFactors = FALSE)
+colnames(pairs_df) <- c("Sample1", "Sample2")
+
+pairs_df$Distance <- bray_mat[
+  cbind(match(pairs_df$Sample1, rownames(bray_mat)),
+        match(pairs_df$Sample2, colnames(bray_mat)))
+]
+
+pairs_df <- pairs_df %>%
+  dplyr::left_join(
+    meta_ctrl %>% dplyr::select(SampleID, Variety),
+    by = c("Sample1" = "SampleID")
+  ) %>%
+  dplyr::rename(Var1 = Variety) %>%
+  dplyr::left_join(
+    meta_ctrl %>% dplyr::select(SampleID, Variety),
+    by = c("Sample2" = "SampleID")
+  ) %>%
+  dplyr::rename(Var2 = Variety) %>%
+  dplyr::mutate(
+    Comparison = ifelse(Var1 == Var2, "Intra-variety", "Inter-variety"),
+    Pair = paste(
+      pmin(as.character(Var1), as.character(Var2)),
+      pmax(as.character(Var1), as.character(Var2)),
+      sep = " vs "
+    )
+  )
+
+
+# ------------------------------------------------------------------------------
+# 4) Intra vs Inter distances
+# ------------------------------------------------------------------------------
+p_intra_inter <- ggplot(pairs_df, aes(x = Comparison, y = Distance)) +
+  geom_violin(trim = FALSE, fill = "grey90") +
+  geom_boxplot(width = 0.25, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.15, size = 0.6) +
+  labs(
+    title = "Community dissimilarity: intra vs inter-variety",
+    y = "Bray–Curtis distance",
+    x = NULL,
+    subtitle = paste(
+      "Wilcoxon p =",
+      signif(wilcox.test(Distance ~ Comparison, data = pairs_df)$p.value, 3)
+    )
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+# ------------------------------------------------------------------------------
+# 5) Multivariate dispersion (betadisper)
+# ------------------------------------------------------------------------------
+bd <- betadisper(bray_dist, meta_ctrl$Variety)
+
+disp_df <- data.frame(
+  SampleID = names(bd$distances),
+  Distance = bd$distances,
+  Variety  = bd$group
+)
+
+p_disp <- ggplot(disp_df, aes(x = Variety, y = Distance, fill = Variety)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.12, alpha = 0.4, size = 1.5) +
+  scale_fill_manual(values = colors_Variety) +
+  labs(
+    title = "Multivariate dispersion (betadisper)",
+    subtitle = "Distance to group centroid",
+    y = "Distance to centroid",
+    x = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+
+# ------------------------------------------------------------------------------
+# 6) Pairwise PERMANOVA (manual)
+# ------------------------------------------------------------------------------
+pairs_levels <- combn(levels(meta_ctrl$Variety), 2, simplify = FALSE)
+
+pw_table <- lapply(pairs_levels, function(p) {
+
+  sub_meta <- meta_ctrl %>% filter(Variety %in% p)
+  sub_dist <- as.dist(bray_mat[sub_meta$SampleID, sub_meta$SampleID])
+
+  ad <- adonis2(sub_dist ~ Variety, data = sub_meta, permutations = 999)
+
+  data.frame(
+    Var1 = p[1],
+    Var2 = p[2],
+    R2   = ad$R2[1],
+    pval = ad$`Pr(>F)`[1]
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(p_adj = p.adjust(pval, method = "BH"))
+
+# ------------------------------------------------------------------------------
+# 7) Heatmap: mean distances + PERMANOVA significance
+# ------------------------------------------------------------------------------
+mean_dist <- pairs_df %>%
+  group_by(Var1, Var2) %>%
+  summarise(MeanDist = mean(Distance), .groups = "drop")
+
+heatmap_df <- expand.grid(Var1 = lvl, Var2 = lvl) %>%
+  left_join(mean_dist, by = c("Var1", "Var2")) %>%
+  left_join(mean_dist, by = c("Var1" = "Var2", "Var2" = "Var1"),
+            suffix = c("", "_rev")) %>%
+  mutate(MeanDist = coalesce(MeanDist, MeanDist_rev))
+
+stars_df <- pw_table %>%
+  mutate(
+    Label = case_when(
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01  ~ "**",
+      p_adj < 0.05  ~ "*",
+      TRUE ~ ""
+    ),
+    Var1 = factor(Var1, levels = lvl),
+    Var2 = factor(Var2, levels = lvl)
+  )
+
+p_heat <- ggplot(heatmap_df, aes(x = Var1, y = Var2, fill = MeanDist)) +
+  geom_tile(color = "white") +
+  scale_fill_distiller(palette = "YlOrRd", name = "Mean Bray–Curtis\nDistance") +
+geom_text(
+  data = stars_df,
+  aes(x = Var1, y = Var2, label = Label),
+  inherit.aes = FALSE,
+  size = 6
+)+
+  labs(
+    title = "Pairwise community dissimilarity and PERMANOVA",
+    subtitle = "Color = mean Bray–Curtis distance | Stars = FDR-adjusted p-value",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# ------------------------------------------------------------------------------
+# 8) Combine panels (optional)
+# ------------------------------------------------------------------------------
+(p_intra_inter | p_disp) / p_heat
+
+ggsave(file.path(output_dir_fig_ITS, "Fig2E_NMDS_Control.svg"), p_heat, width = 5, height = 3)
+
+
+```
+
+
+
+
+
+# --- FIG 3: VENN DIAGRAM & CORE MICROBIOTA ---
+```{r}
+# ==============================================================================
+# 1. DATA PREPARATION AND FILTERING FOR VENN DIAGRAM
+# ==============================================================================
+
+# Using the filtered phyloseq object (Control samples, 10 reads filter)
+# Extracting tables (maintaining original row names)
+otu_controls <- as.data.frame(otu_table(psITS_control_10))
+metadata_controls <- as.data.frame(sample_data(psITS_control_10))
+
+# Core filtering parameters per variety
+min_abundance <- 100     # Minimum total reads per variety
+min_prev      <- 0.8     # Minimum prevalence (80% of samples)
+
+# Identifying varieties present in the dataset
+varieties <- unique(metadata_controls$Variety)
+
+# Extracting ASVs per variety based on filters
+otu_listF <- lapply(varieties, function(var) {
+  # Subset samples for the specific variety
+  samples <- rownames(metadata_controls[metadata_controls$Variety == var, ])
+  samples <- intersect(samples, rownames(otu_controls))
+  
+  if (length(samples) == 0) return(character(0))
+  
+  # Variety-specific OTU subset
+  otu_subset <- otu_controls[samples, , drop = FALSE]
+  
+  # Filter 1: Total abundance within this variety >= min_abundance
+  pass_abundance <- colSums(otu_subset) >= min_abundance
+  
+  # Filter 2: Prevalence (present in >= 80% of samples)
+  pass_prevalence <- (colSums(otu_subset > 0) / nrow(otu_subset)) >= min_prev
+  
+  # Final selection: ASVs passing both filters
+  keep_asv <- pass_abundance & pass_prevalence
+  
+  return(colnames(otu_subset)[keep_asv])
+})
+
+names(otu_listF) <- varieties
+otu_list_venn_ct <- otu_listF
+
+
+# ==============================================================================
+# 2. CORE MICROBIOTA STATISTICS
+# ==============================================================================
+
+# Define the "Core Microbiota" as the intersection of all varieties
+core_asvs <- Reduce(intersect, otu_list_venn_ct)
+
+# Global metrics for the dataset (psITS_control_10)
+total_asvs_count <- ntaxa(psITS_control_10_rare)                   
+total_reads_count <- sum(sample_sums(psITS_control_10_rare))       
+
+# Specific metrics for the Core
+core_asvs_count <- length(core_asvs)                 
+core_reads_count <- sum(otu_controls[, colnames(otu_controls) %in% core_asvs])
+
+# Proportion calculations
+prop_diversity <- (core_asvs_count / total_asvs_count) * 100
+prop_abundance <- (core_reads_count / total_reads_count) * 100
+
+# Print statistics to console
+cat("\n=================================================\n")
+cat("📊 CORE MICROBIOTA STATISTICS\n")
+cat("=================================================\n")
+cat("Total ASVs in study           : ", total_asvs_count, "\n")
+cat("Core ASVs count               : ", core_asvs_count, "\n")
+cat("👉 Proportion of Diversity    : ", round(prop_diversity, 2), "%\n\n")
+
+cat("Total Reads in dataset        : ", total_reads_count, "\n")
+cat("Core Reads count              : ", core_reads_count, "\n")
+cat("👉 Proportion of Abundance    : ", round(prop_abundance, 2), "%\n")
+cat("=================================================\n\n")
+
+# ==============================================================================
+# 3. VENN DIAGRAM VISUALIZATION
+# ==============================================================================
+
+# Color palette definition
+colors_Variety <- c(
+  "Leak"         = "#7CAE00", 
+  "PhkarRumduol" = "#00BFC4", 
+  "PhkarMalis"   = "#FF3B0A",
+  "Russey"       = "#FFC000", 
+  "IR64"         = "#9E1FFF"
+)
+
+# Align colors with the order of varieties in the list
+colors_ordered <- colors_Variety[names(otu_list_venn_ct)]
+
+# Generate Venn Diagram
+venn <- ggVennDiagram(otu_list_venn_ct, 
+                      set_color = colors_ordered,    
+                      set_size = 5,                  
+                      label = "count",               
+                      label_alpha = 0) +             
+  scale_fill_gradient(low = "#F2EBBBFF", high = "#7F1019", name = "ASV Count") +
+  labs(title = "Core Microbiota - Shared ASVs (Control Roots)") +
+  theme(legend.position = "right")
+
+print(venn)
+
+# Save figure - # Change to your directory
+ggsave(filename = file.path(output_dir_fig_ITS, "Fig3_Venn_Core_Roots.svg"), 
+       plot = venn, width = 8, height = 6)
+
+
+
+
+# ==============================================================================
+# 4. DONUT CHART (Core Taxonomic Composition - Genus)
+# ==============================================================================
+
+rank_to_show <- "Genus"
+min_pct_other <- 2 
+
+tax_df <- as.data.frame(tax_table(psITS_control_10_rare))
+tax_df$ASV <- rownames(tax_df)
+
+# Subset OTU table to include only Core ASVs
+otu_core_subset <- otu_controls[, colnames(otu_controls) %in% core_asvs, drop=FALSE]
+core_abundance_vec <- colSums(otu_core_subset)
+
+core_tax_df <- data.frame(
+  ASV = names(core_abundance_vec),
+  Abundance = as.numeric(core_abundance_vec)
+) %>%
+  left_join(tax_df, by = "ASV")
+
+# Summarize core composition by Genus
+core_summary <- core_tax_df %>%
+  filter(!is.na(.data[[rank_to_show]]), 
+         .data[[rank_to_show]] != "Unclassified") %>% 
+  group_by(.data[[rank_to_show]]) %>%
+  summarise(TotalAbundance = sum(Abundance), .groups = "drop") %>%
+  mutate(pct = 100 * TotalAbundance / sum(TotalAbundance)) %>%
+  
+  # Group low abundance genera into "Other"
+  mutate(DisplayGroup = ifelse(pct < min_pct_other, "Other", .data[[rank_to_show]])) %>%
+  group_by(DisplayGroup) %>%
+  summarise(TotalAbundance = sum(TotalAbundance), .groups = "drop") %>%
+  mutate(pct = round(100 * TotalAbundance / sum(TotalAbundance), 1)) %>%
+  arrange(desc(pct))
+
+# Set colors
+lvls <- core_summary$DisplayGroup
+pal_vec <- colorRampPalette(brewer.pal(12, "Set3"))(length(lvls))
+names(pal_vec) <- lvls
+if("Other" %in% names(pal_vec)) pal_vec["Other"] <- "grey80"
+
+# Plot Genus Donut Chart
+donut_core <- ggplot(core_summary, aes(x = 2, y = pct, fill = fct_reorder(DisplayGroup, pct))) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  xlim(0.5, 2.5) +
+  theme_void() +
+  geom_text(aes(label = paste0(DisplayGroup, " (", pct, "%)")),
+            position = position_stack(vjust = 0.5), size = 3.5) +
+  scale_fill_manual(values = pal_vec, name = rank_to_show) +
+  labs(title = paste0("Core Microbiota Composition (", rank_to_show, ")"),
+       subtitle = paste0("Represents ", round(prop_abundance, 1), "% of total reads in dataset"))
+
+print(donut_core)
+
+ggsave(filename = file.path(output_dir_fig_ITS, "Fig3_Core_Donut_Genus.svg"), 
+       plot = donut_core, width = 8, height = 6)
+
+
+# ==============================================================================
+# 5. DONUT CHART (Core Taxonomic Composition - Family)
+# ==============================================================================
+
+rank_to_show <- "Genus"
+rank_parent <- "Family"
+min_pct_other <- 2       
+min_pct_label <- 2       
+
+tax_df <- as.data.frame(tax_table(psITS_control_10_rare))
+tax_df$ASV <- rownames(tax_df)
+
+otu_mat <- as.data.frame(otu_table(psITS_control_10_rare))
+otu_core <- otu_mat[, colnames(otu_mat) %in% core_asvs, drop = FALSE]
+core_abundance <- colSums(otu_core)
+
+df_core <- data.frame(ASV = names(core_abundance), Abundance = core_abundance) %>%
+  left_join(tax_df, by = "ASV")
+
+# Aggregation logic
+core_summary_fam <- df_core %>%
+  filter(!is.na(.data[[rank_to_show]]), 
+         .data[[rank_to_show]] != "Unclassified") %>%
+  group_by(.data[[rank_to_show]], .data[[rank_parent]]) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+  mutate(pct = 100 * Abundance / sum(Abundance)) %>%
+  mutate(
+    Genus_Group = ifelse(pct < min_pct_other, "Other", .data[[rank_to_show]]),
+    Family_Group = ifelse(pct < min_pct_other, "Other", .data[[rank_parent]])
+  ) %>%
+  group_by(Genus_Group, Family_Group) %>%
+  summarise(pct = sum(pct), .groups = "drop") %>%
+  arrange(Family_Group, desc(pct))
+
+# Reorder factors for consistent plotting
+core_summary_fam$Genus_Group <- factor(core_summary_fam$Genus_Group, levels = core_summary_fam$Genus_Group)
+levels_fam <- unique(core_summary_fam$Family_Group)
+levels_fam <- c(setdiff(levels_fam, "Other"), "Other")
+core_summary_fam$Family_Group <- factor(core_summary_fam$Family_Group, levels = levels_fam)
+
+core_summary_fam <- core_summary_fam %>%
+  mutate(Label = ifelse(pct >= min_pct_label, paste0(Genus_Group, "\n(", round(pct, 1), "%)"), ""))
+
+# Defined Family color palette
+# Defined Family color palette (ITS – matched tones to 16S)
+family_colors_ITS <- c(
+  "Aspergillaceae"      = "#F4A261",  # warm orange (close to Burkholderiaceae)
+  "Branch06_fam_Is"     = "#2A9D8F",  # muted teal (close to Comamonadaceae)
+  "Hypocreaceae"        = "#E9C46A",  # soft yellow (close to Sphingomonadaceae)
+  "Magnaporthaceae"     = "#E76F51",  # coral/red-orange (distinct but warm)
+  "Nectriaceae"         = "#C8553D",  # darker terracotta (same warm family)
+  "Coniochaetaceae"     = "#8D99AE",  # grey-blue (analogous to muted taxa)
+  "Pleosporaceae"       = "#6D597A",  # muted purple (close to Chitinophagaceae)
+  "Sporormiaceae"       = "#B56576",  # dusty rose (soft contrast)
+  "Trichocomaceae"      = "#A7C957",  # soft green (natural, plant-friendly)
+  "Ustilaginaceae"      = "#BC6C25",  # brownish ochre (fungal/soil tone)
+  "Other"               = "#D3D3D3"   # SAME as 16S (requested)
+)
+
+
+# Plot Family Donut Chart
+donut_core_fam <- ggplot(core_summary_fam, aes(x = 2, y = pct, fill = Family_Group)) +
+  geom_col(width = 1, color = "white", linewidth = 1) + 
+  coord_polar(theta = "y") +
+  xlim(0.5, 2.5) +
+  geom_text(aes(label = Label), position = position_stack(vjust = 0.5),
+            size = 3.5, fontface = "bold", color = "black") + 
+  scale_fill_manual(values = family_colors_ITS, name = "Family") +
+  theme_void() +
+  labs(title = paste0("Core Microbiota (", rank_to_show, ")"),
+       subtitle = "Grouped by Family") +
+  theme(legend.position = "right", legend.title = element_text(face="bold"))
+
+print(donut_core_fam)
+
+ggsave(file.path(output_dir_fig_ITS, "Fig3_Core_Donut_Family_Custom.svg"),
+  donut_core_fam, width = 10, height = 7)
+```
+
+
+# --- FIG 4.A: ALPHA, IMPACT OF INOCULATION ---
+```{r}
+
+library(ggplot2)
+library(ggpubr)
+
+#Table of alpha-diversity estimators
+table_variety <- estimate_richness(psITS_Root_10, split = TRUE, measures=c("Observed", "Shannon"))
+#Add evenness
+H.variety <- table_variety$Shannon
+S1.variety <- table_variety$Observed
+S.variety <- log(S1.variety)
+eve_variety <- H.variety/S.variety
+table_variety$Evenness <- eve_variety
+#Bind sampledata + table of alpha_div (here R1 only)
+datar.variety <- cbind(sample_data(psITS_Root_10), table_variety)
+
+
+
+# Définition des couleurs personnalisées
+group_colors <- c(
+                "IR64_Control" = "#9E1FFF", "IR64_Inoculated" = "#CA85FF", 
+                "Leak_Control" = "#7CAE00", "Leak_Inoculated" = "#AFF500", 
+                "PhkarRumduol_Control" = "#00BFC4", "PhkarRumduol_Inoculated" = "#00EDF5", 
+                "PhkarMalis_Control"="#FF3B0A","PhkarMalis_Inoculated"="#FF7C5C",
+                "Russey_Control"="#FFC000","Russey_Inoculated"="#FFD65C")
+
+datar.variety$Inoculation <- ifelse(
+  grepl("Control", datar.variety$Group),
+  "Control",
+  "Inoculated"
+)
+
+# Graphiques avec corrections
+
+p.ric.variety <- ggplot(
+  datar.variety,
+  aes(x = Group, y = Observed, fill = Group, colour = Inoculation)
+) +
+  geom_boxplot(outlier.shape = NA, linewidth = 1) +
+  geom_jitter(
+    aes(color = Inoculation),
+    size = 2,
+    alpha = 0.6
+  ) +  scale_fill_manual(values = group_colors) +
+  scale_colour_manual(values = condition_colors) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank()
+  ) +
+  ggtitle("A. Observed ASV Richness") +
+  stat_compare_means(
+    aes(label = ..p.signif..),
+    method = "wilcox.test",
+    comparisons = list(
+      c("IR64_Control", "IR64_Inoculated"),
+      c("Leak_Control", "Leak_Inoculated"),
+      c("PhkarRumduol_Control", "PhkarRumduol_Inoculated"),
+      c("PhkarMalis_Control", "PhkarMalis_Inoculated"),
+      c("Russey_Control", "Russey_Inoculated")
+    )
+  )
+
+
+p.ric.variety
+ggsave(p.ric.variety, output_dir_fig_ITS, dpi=300, device = "svg", width = 8, height = 4, filename = "Fig4.A_richness_variety_condition.svg")
+
+```
+
+# --- FIG 4.B: BETA, IMPACT OF INOCULATION ---
+```{r}
+library(vegan)
+library(ggplot2)
+library(dplyr)
+library(phyloseq)
+
+# ==============================================================================
+# 1. DATA PREPARATION
+# ==============================================================================
+# Re-extract metadata to ensure we have Symptoms and Size columns available
+sample_metadata <- data.frame(sample_data(psITS_Root_10_rare))
+sample_metadata$SampleID <- rownames(sample_metadata)
+
+# Calculate Bray-Curtis distance matrix
+otu_mat <- as.matrix(otu_table(psITS_Root_10_rare))
+bray_dist <- vegdist(otu_mat, method = "bray")
+
+# Calculate Global Range for Size Legend (Standardization)
+global_symptom_range <- range(sample_metadata$Symptoms_up, na.rm = TRUE)
+
+# ==============================================================================
+# 2. PLOT GENERATION LOOP
+# ==============================================================================
+variety_list <- unique(sample_metadata$Variety)
+
+for (current_var in variety_list) {
+  
+  # A. Subset data
+  subset_info <- sample_metadata %>% filter(Variety == current_var)
+  
+  if (nrow(subset_info) < 3) next
+  
+  # B. Subset distance
+  subset_dist <- as.dist(as.matrix(bray_dist)[subset_info$SampleID, subset_info$SampleID])
+  
+  # C. Run NMDS
+  nmds_res <- tryCatch({
+    metaMDS(subset_dist, k = 2, trymax = 100, trace = FALSE)
+  }, error = function(e) { return(NULL) })
+  
+  if (is.null(nmds_res)) next
+  
+  # D. Prepare Plotting Data
+  nmds_pts <- as.data.frame(nmds_res$points)
+  nmds_pts$SampleID <- rownames(nmds_pts)
+  nmds_plot_df <- left_join(nmds_pts, subset_info, by = "SampleID")
+  
+  # Group for Fill color (Variety_Condition)
+  nmds_plot_df$Group <- paste(current_var, nmds_plot_df$Condition, sep = "_")
+  
+  # E. Statistics (PERMANOVA)
+  perm_res <- adonis2(subset_dist ~ Condition, data = subset_info, permutations = 999)
+  
+  # F. Visualization
+  stats_label <- paste0("Stress = ", round(nmds_res$stress, 3), 
+                        " | R² = ", round(perm_res$R2[1], 3), 
+                        " | p = ", round(perm_res$`Pr(>F)`[1], 3))
+  
+  p_var <- ggplot(nmds_plot_df, aes(x = MDS1, y = MDS2, 
+                                    color = Condition, # Outline Color (Points + Ellipse)
+                                    fill = Group,      # Inside Color (Ellipse only)
+                                    size = Symptoms_up)) +
+    
+    # Ellipses: Removed 'color = NA' so it inherits 'color = Condition'
+    stat_ellipse(geom = "polygon", alpha = 0.2) +
+    
+    geom_point(alpha = 0.8) +
+    
+    # Colors
+    scale_color_manual(values = condition_colors) + 
+    scale_fill_manual(values = group_colors) +      
+    
+    # Size Scale (Standardized)
+    scale_size_continuous(
+      name = "Symptoms (cm)", 
+      range = c(2, 8),               
+      limits = global_symptom_range,
+      breaks = waiver()
+    ) +
+    
+    # LEGEND MANAGEMENT: Remove Fill (Group), Keep Color (Condition) & Size
+    guides(fill = "none") +
+    
+    theme_minimal(base_size = 14) +
+    labs(title = paste("Variety:", current_var), subtitle = stats_label) +
+    theme(plot.subtitle = element_text(size = 14, face = "italic"))
+
+  # G. Save Figure
+  fig_name <- paste0("Fig4_NMDS_", current_var, "_Inoculation_Impact.svg")
+  ggsave(filename = file.path(output_dir_fig_ITS, fig_name), plot = p_var, width = 6, height = 5)
+}
+
+message("✅ Updated Figure 4 (Colored outlines, cleaned legends) saved.")
+```
+
+
+# --- FIG 5: GLOBAL EFFECT OF INOCULATION (DESEQ_MANHATTAN PLOT) ---
+```{r}
+library(phyloseq)
+library(DESeq2)
+library(dplyr)
+library(apeglm)
+library(ggplot2)
+
+# 1) Data Input: Use the NON-rarefied phyloseq object
+ps <- psITS_Root_10  
+
+# 2) DESeq2 Processing -----------------------------------------------------
+# Model design: account for Variety background to isolate the Inoculation effect
+dds <- phyloseq_to_deseq2(ps, ~ Variety + Condition)
+dds$Condition <- relevel(dds$Condition, "Control")  # Set Control as reference
+
+dds <- DESeq(dds, test = "Wald", fitType = "parametric")
+
+# Results for the average effect of inoculation (Inoculated vs Control)
+res <- results(dds, contrast = c("Condition", "Inoculated", "Control"))
+
+# Log2 Fold Change Shrinkage (standard for stable estimation)
+# Ensure the coefficient matches resultsNames(dds)
+res_shr <- lfcShrink(dds, coef = "Condition_Inoculated_vs_Control", type = "apeglm")
+
+# 3) Merge Results with Taxonomy -------------------------------------------
+out <- as.data.frame(res_shr) %>%
+  mutate(pvalue = res$pvalue, 
+         padj = res$padj,
+         ASV = rownames(res_shr))
+
+tax <- as.data.frame(as(tax_table(ps), "matrix"))
+tax$ASV <- rownames(tax)
+
+out <- left_join(out, tax, by = "ASV") %>%
+  arrange(pvalue)
+
+# 4) Significant ASV Summary -----------------------------------------------
+sig <- out %>% filter(!is.na(pvalue), pvalue < 0.05)
+message("Number of globally significant ASVs (p < 0.05): ", nrow(sig))
+
+# Summary by Phylum
+by_phylum <- sig %>%
+  mutate(
+    Phylum   = as.character(Phylum),
+    enriched = as.integer(log2FoldChange > 0), # Enrichment indicator
+    depleted = as.integer(log2FoldChange < 0)  # Depletion indicator
+  ) %>%
+  group_by(Phylum) %>%
+  summarise(
+    n_sig      = n(),
+    n_enriched = sum(enriched, na.rm = TRUE),
+    n_depleted = sum(depleted, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_enriched))
+
+print(by_phylum)
+
+# 5) Volcano Plot ----------------------------------------------------------
+ggplot(out, aes(x = log2FoldChange, y = -log10(pvalue))) +
+  geom_point(aes(color = pvalue < 0.05), alpha = 0.6) +
+  scale_color_manual(values = c("grey70", "#D55E00"), name = "Significant (p < 0.05)") +
+  geom_vline(xintercept = 0, linetype = 2) +
+  theme_minimal() +
+  labs(title = "Global Differential Abundance: Inoculated vs Control",
+       subtitle = "Adjusted for Variety effect",
+       x = "log2FoldChange (Inoculated / Control)", 
+       y = expression(-log[10](p-value)))
+#manhattan plot
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(scales)
+library(grid)
+
+## ====== Parameters and Data Preparation ======
+ps            <- psITS_Root_10       
+use_p         <- "pvalue"           # Options: "pvalue" or "padj"
+alpha         <- 0.05
+label_top     <- 25
+jitter_w      <- 0.28
+top_phyla     <- 10
+size_breaks   <- c(0.01, 0.05, 0.10, 0.50, 1.00)
+
+# Calculate Global Relative Abundance (%)
+ra_pct <- 100 * taxa_sums(ps) / sum(taxa_sums(ps))
+ra_df  <- tibble::tibble(ASV = names(ra_pct), rel_abund_pct = as.numeric(ra_pct))
+
+# Format p-values and log-transformation
+P_vec <- as.numeric(out[[use_p]])
+P_vec[!is.finite(P_vec) | P_vec <= 0] <- NA_real_
+y_vec <- -log10(pmin(pmax(P_vec, 1e-300), 1))
+
+df0 <- out %>%
+  dplyr::mutate(P = P_vec, y = y_vec) %>%
+  dplyr::left_join(ra_df, by = "ASV") %>%
+  dplyr::mutate(
+    Phylum = ifelse(is.na(Phylum) | Phylum == "", "Others", as.character(Phylum)),
+    Order  = ifelse(is.na(Order)  | Order  == "", "Unclassified", as.character(Order)),
+    rel_abund_pct = tidyr::replace_na(rel_abund_pct, 0),
+    sig = is.finite(P) & P < alpha
+  ) %>%
+  dplyr::filter(is.finite(y))
+
+## ====== Manhattan Plot Function ======
+make_manh <- function(df0, direction = c("enriched", "depleted"),
+                      top_phyla = 12, alpha = 0.05, label_top = 25,
+                      jitter_w = 0.28, bg_alpha = 0.10,
+                      palette_cols = c("#78A1BB","#EEB902","#7776BC","#EC7357", "#28AFB0", 
+                                       "#97CC04","#E13700","#C09BD8", "#337CA0")) {
+
+  direction <- match.arg(direction)
+  df_sub <- if (direction == "enriched") dplyr::filter(df0, log2FoldChange > 0)
+            else                         dplyr::filter(df0, log2FoldChange < 0)
+
+  # Order phyla by ASV count - Forced dplyr to avoid conflicts
+  ph_order <- df_sub %>%
+    dplyr::count(Phylum, name = "n") %>%
+    dplyr::arrange(dplyr::desc(n)) %>%
+    dplyr::pull(Phylum)
+
+  keep <- head(ph_order, top_phyla)
+  df_sub <- df_sub %>%
+    dplyr::mutate(Phylum2 = ifelse(Phylum %in% keep, Phylum, "Others"))
+
+  ph_axis <- c(keep, setdiff("Others", keep))
+
+  # Index Orders within Phylum for X-axis positioning
+  ord_map <- df_sub %>%
+    dplyr::distinct(Phylum2, Order) %>%
+    dplyr::arrange(factor(Phylum2, levels = ph_axis), Order) %>%
+    dplyr::group_by(Phylum2) %>%
+    dplyr::mutate(ord_idx = match(Order, unique(Order))) %>%
+    dplyr::ungroup()
+
+  # Calculate block positions
+  ph_info <- ord_map %>%
+    dplyr::group_by(Phylum2) %>%
+    dplyr::summarise(n_ord = max(ord_idx), .groups = "drop") %>%
+    dplyr::arrange(factor(Phylum2, levels = ph_axis)) %>%
+    dplyr::mutate(start = c(0, head(cumsum(n_ord), -1)),
+                  mid   = start + n_ord/2 + 0.5)
+
+  # Coordinates and jitter
+  df_plot <- df_sub %>%
+    dplyr::left_join(ord_map, by = c("Phylum2", "Order")) %>%
+    dplyr::left_join(ph_info, by = "Phylum2") %>%
+    dplyr::mutate(x_core = start + ord_idx,
+                  x      = x_core + runif(dplyr::n(), -jitter_w, jitter_w))
+
+  # Color assignment
+  n_needed  <- length(ph_axis)
+  pal_auto  <- grDevices::colorRampPalette(palette_cols)(n_needed)
+  pal       <- stats::setNames(pal_auto, ph_axis)
+  pal["Others"] <- "#9E9E9E"
+
+  # Background blocks
+  bg <- ph_info %>%
+    dplyr::mutate(xmin = start + 0.5, xmax = start + n_ord + 0.5)
+
+  # Taxon labels
+  lab_df <- df_plot %>%
+    dplyr::filter(sig) %>%
+    dplyr::arrange(P, dplyr::desc(abs(log2FoldChange))) %>%
+    dplyr::slice_head(n = label_top) %>%
+    dplyr::mutate(
+      Genus   = na_if(trimws(as.character(Genus)), ""),
+      Species = na_if(trimws(as.character(Species)), ""),
+      Species = dplyr::if_else(
+        !is.na(Species) & tolower(Species) %in% c("sp.", "sp", "uncultured", "uncultured bacterium"),
+        NA_character_, Species
+      ),
+      line1 = dplyr::case_when(
+        !is.na(Genus) & !is.na(Species) ~ paste0(Genus, "_", Species),
+        !is.na(Genus)                   ~ paste0(Genus, "_sp."),
+        TRUE                            ~ "Unassigned"
+      ),
+      line2 = paste0("(", ASV, ")"),
+      label = paste0(line1, "\n", line2)
+    )
+
+  ttl <- if (direction == "enriched") "Global DA — Enriched ASVs (log2FC > 0)"
+         else                         "Global DA — Depleted ASVs (log2FC < 0)"
+
+  # Final ggplot
+  p <- ggplot(df_plot, aes(x = x, y = y)) +
+    geom_rect(data = bg,
+              aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = Phylum2),
+              inherit.aes = FALSE, alpha = bg_alpha, colour = NA, show.legend = FALSE) +
+    geom_hline(yintercept = -log10(alpha), linetype = 2, color = "grey40") +
+    geom_point(aes(color = Phylum2, size = rel_abund_pct), alpha = 0.9) +
+    ggrepel::geom_text_repel(
+      data = lab_df, aes(label = label, color = Phylum2),
+      size = 3.1, max.overlaps = Inf, seed = 1,
+      box.padding = 0.4, point.padding = 0.25, segment.alpha = 0.5, show.legend = FALSE
+    ) +
+    scale_color_manual(values = pal, name = "Phylum") +
+    scale_fill_manual(values = pal, guide = "none") +
+    guides(
+      color = guide_legend(
+        override.aes = list(shape = 15, size = 6, alpha = 1),  
+        keywidth = unit(8, "mm"), keyheight = unit(8, "mm"),
+        title.position = "top"
+      ),
+      size = guide_legend(order = 2) 
+    ) +
+    scale_size_continuous(
+      range = c(1.6, 6.2),
+      breaks = size_breaks, labels = paste0(size_breaks, "%"),
+      name = "Relative abundance (%)"
+    ) +
+    scale_x_continuous(breaks = ph_info$mid, labels = ph_info$Phylum2, expand = c(0.01, 0.01)) +
+    labs(
+      title    = ttl,
+      subtitle = paste0("ASVs plotted by -log10(", if (use_p=="padj") "FDR" else "p-value", ") vs Phylum"),
+      x = NULL,
+      y = if (use_p=="padj") expression(-log[10]("FDR")) else expression(-log[10](p-value))
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "right",
+      legend.key.size = unit(9, "mm"),
+      legend.text  = element_text(size = 11),
+      legend.title = element_text(size = 12, face = "bold"),
+      axis.text.x = element_text(angle = 25, hjust = 1),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank()
+    )
+
+  return(p)
+}
+
+## ====== Custom Palette ======
+pal_user <- c("#78A1BB","#EEB902","#7776BC","#EC7357", "#28AFB0", 
+              "#97CC04","#E13700","#C09BD8", "#337CA0")
+
+## ====== Generate Plots ======
+p_enr <- make_manh(df0, direction = "enriched",
+                   top_phyla = top_phyla, alpha = alpha,
+                   label_top = label_top, jitter_w = jitter_w,
+                   palette_cols = pal_user)
+
+p_dep <- make_manh(df0, direction = "depleted",
+                   top_phyla = top_phyla, alpha = alpha,
+                   label_top = label_top, jitter_w = jitter_w,
+                   palette_cols = pal_user)
+
+p_enr; p_dep
+
+# Save plots
+ggsave(file.path(output_dir_fig_ITS, paste0("Fig5_Manhattan_Enriched_", use_p, ".svg")),
+       p_enr, width = 12, height = 7)
+
+ggsave(file.path(output_dir_fig_ITS, paste0("Fig5_Manhattan_Depleted_", use_p, ".svg")),
+       p_dep, width = 12, height = 7)
+```
+
+# --- FIG 6: ALDEX2 BY VARIETY ---
+```{r}
+library(ALDEx2)
+library(tidyverse)
+library(phyloseq)
+library(openxlsx)
+
+# Set seed for reproducibility (CRITICAL for ALDEx2)
+set.seed(123)
+
+varieties <- unique(as.character(sample_data(psITS_Root_10)$Variety))
+all_genus_results <- list()
+all_asv_results <- list()
+
+# ============================
+# 📌 GENUS Loop
+# ============================
+for (variety in varieties) {
+  message("🔹 Processing (GENUS) : ", variety)
+  
+  # Using your exact subsetting logic but secured for the loop
+  ps_variety <- prune_samples(sample_data(psITS_Root_10)$Variety == variety, psITS_Root_10)
+  
+  ps_genus <- tax_glom(ps_variety, taxrank = "Genus", NArm = TRUE)
+  
+  otu <- otu_table(ps_genus)
+  if (!taxa_are_rows(otu)) { otu <- t(otu) }
+  otu_df <- as.data.frame(otu)
+  
+  condition <- as.character(sample_data(ps_genus)$Condition)
+  
+  # ALDEx2 process
+  aldex_res <- aldex.clr(otu_df, conds = condition, mc.samples = 128, denom = "all", verbose = FALSE)
+  aldex_tt  <- aldex.ttest(aldex_res, paired.test = FALSE)
+  aldex_eff <- aldex.effect(aldex_res)
+  
+  res <- data.frame(aldex_tt, aldex_eff)
+  res$Feature <- rownames(res)
+  res$Variety <- variety
+  
+  tax <- as.data.frame(as(tax_table(ps_genus), "matrix"))
+  tax$Feature <- rownames(tax)
+  res_annot <- merge(res, tax, by = "Feature")
+  
+  # Your exact filter
+  res_sig <- res_annot %>% filter(wi.ep < 0.05 & abs(diff.btw) > 1)
+  
+  all_genus_results[[variety]] <- res_sig
+}
+
+# ============================
+# 📌 ASV Loop
+# ============================
+for (variety in varieties) {
+  message("🔹 Processing (ASV) : ", variety)
+  
+  ps_variety <- prune_samples(sample_data(psITS_Root_10)$Variety == variety, psITS_Root_10)
+  
+  otu <- otu_table(ps_variety)
+  if (!taxa_are_rows(otu)) { otu <- t(otu) }
+  otu_df <- as.data.frame(otu)
+  
+  condition <- as.character(sample_data(ps_variety)$Condition)
+  
+  aldex_res <- aldex.clr(otu_df, conds = condition, mc.samples = 128, denom = "all", verbose = FALSE)
+  aldex_tt  <- aldex.ttest(aldex_res, paired.test = FALSE)
+  aldex_eff <- aldex.effect(aldex_res)
+  
+  res <- data.frame(aldex_tt, aldex_eff)
+  res$ASV <- rownames(res)
+  res$Variety <- variety
+  
+  tax <- as.data.frame(as(tax_table(ps_variety), "matrix"))
+  tax$ASV <- rownames(tax)
+  tax$Feature <- paste(tax$Genus, tax$Species, tax$ASV, sep = "_")
+  res <- merge(res, tax, by = "ASV")
+  
+  # Your exact filter
+  res_sig <- res %>% filter(wi.ep < 0.05 & abs(diff.btw) > 1)
+  all_asv_results[[variety]] <- res_sig
+}
+
+# Merge and Export
+final_genus_df <- bind_rows(all_genus_results)
+final_asv_df   <- bind_rows(all_asv_results)
+
+
+
+wb <- createWorkbook()
+addWorksheet(wb, "Significant_Genus")
+writeData(wb, "Significant_Genus", final_genus_df)
+addWorksheet(wb, "Significant_ASVs")
+writeData(wb, "Significant_ASVs", final_asv_df)
+saveWorkbook(wb, output_dir_fig_ITS, overwrite = TRUE)
+
+message("✅ Excel file successfully created: ", output_dir_fig_ITS)
+
+
+
+library(dplyr)
+library(ggplot2)
+library(phyloseq)
+
+# 1. Load ALDEx2 results (from Genus sheet)
+aldex_plot_data <- final_genus_df
+
+# 2. Calculate average relative abundance per Genus and Variety
+# Transform counts to percentages using the non-rarefied filtered object
+ps_rel <- transform_sample_counts(psITS_Root_10, function(x) 100 * x / sum(x))
+ps_genus_rel <- tax_glom(ps_rel, taxrank = "Genus", NArm = TRUE)
+
+# Melt to data frame
+melted_genus <- psmelt(ps_genus_rel)
+
+# Group by Variety and Genus to get the mean
+abundance_stats <- melted_genus %>%
+  dplyr::group_by(Variety, Genus) %>%
+  dplyr::summarise(MeanAbundance = mean(Abundance), .groups = "drop")
+
+# 3. Merge ALDEx2 results with mean abundances
+plot_df <- left_join(aldex_plot_data, abundance_stats, by = c("Variety", "Genus"))
+
+# 4. Final Plot Preparation
+plot_df <- plot_df %>%
+  dplyr::filter(!is.na(diff.btw)) %>%
+  # Reorder Genus by effect size for better visualization
+  mutate(Genus = reorder(Genus, diff.btw))
+
+# 5. Bubble Plot Visualization
+p_aldex <- ggplot(plot_df, aes(x = diff.btw, y = Genus, color = Variety)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  
+  # Points sized by mean relative abundance
+  geom_point(aes(size = MeanAbundance), alpha = 0.8) +
+  
+  # Standardize colors based on your defined variety palette
+  scale_color_manual(values = colors_Variety) + 
+  
+  # Point size scale
+  scale_size_continuous(name = "Mean Rel. Abundance (%)", range = c(2, 8)) +
+  
+  # --- MODIFICATION 1 : Déplacer l'axe Y à droite ---
+  scale_y_discrete(position = "right") +
+  
+  # Labels
+  labs(
+    title = "Differentially Abundant Genera (ALDEx2)",
+    subtitle = "Point size represents mean relative abundance within each variety",
+    x = "Median CLR Difference (Control < 0 < Inoculated)",
+    y = NULL
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 0.5),
+    
+    # --- MODIFICATION 2 : Mettre le texte de l'axe Y en italique ---
+    axis.text.y = element_text(face = "italic")
+  )
+
+print(p_aldex)
+
+# Save Plot
+ggsave(file.path(output_dir_fig_ITS, "Fig6_ALDEx2_Genus_BubblePlot.svg"), 
+       plot = p_aldex, width = 6, height = 6) # J'ai augmenté légèrement la largeur (width) pour accommoder le texte à droite
+
+```
+
+
+```{r}
+# --- FIG 6: ALTERNATIVE DESEQ2 BY VARIETY ---
+```{r}
+library(DESeq2)
+library(dplyr)
+library(tidyr)
+
+# 1. Setup ---------------------------------------------------------------------
+# Use non-rarefied counts (psITS_Root_10)
+psITS_Root_100 <- phyloseq::filter_taxa(psITS_Root, function(x) sum(x) >= 100, prune = TRUE)
+
+ps_ds_v <- psITS_Root_100
+variety_list <- unique(as.character(sample_data(ps_ds_v)$Variety))
+
+# List to store significant results for each variety
+deseq_variety_results <- list()
+
+# 2. Iterative DESeq2 Analysis -------------------------------------------------
+for (current_var in variety_list) {
+  message("🔹 Processing DESeq2 for variety: ", current_var)
+  
+  # Subset phyloseq for the specific variety
+  ps_sub <- prune_samples(sample_data(ps_ds_v)$Variety == current_var, ps_ds_v)
+  
+  # Ensure Condition is a factor with Control as reference
+  sample_data(ps_sub)$Condition <- factor(sample_data(ps_sub)$Condition, levels = c("Control", "Inoculated"))
+  
+  # Convert to DESeq2 object
+  # Design: ~ Condition (since we are looking at one variety at a time)
+  dds_sub <- phyloseq_to_deseq2(ps_sub, ~ Condition)
+  
+  # Run DESeq2
+  dds_sub <- DESeq(dds_sub, test = "Wald", fitType = "parametric")
+  
+  # Extract results (Inoculated vs Control)
+  res_v <- results(dds_sub, contrast = c("Condition", "Inoculated", "Control"))
+  
+  # Merge with taxonomy
+  res_df <- as.data.frame(res_v) %>%
+    mutate(ASV = rownames(.), Variety = current_var)
+  
+  tax_df <- as.data.frame(as(tax_table(ps_sub), "matrix")) %>% rownames_to_column("ASV")
+  res_df <- left_join(res_df, tax_df, by = "ASV")
+  
+  # Filter for nominally significant ASVs (unadjusted p-value < 0.05)
+  res_sig <- res_df %>% 
+    dplyr::filter(!is.na(pvalue), pvalue < 0.05)
+  
+  if(nrow(res_sig) > 0) {
+    deseq_variety_results[[current_var]] <- res_sig
+  }
+}
+
+# Combine all results into one dataframe
+final_deseq_var_df <- bind_rows(deseq_variety_results)
+
+
+
+# 1. Calculate Mean Relative Abundance -----------------------------------------
+# We use percentages to scale the points in the bubble plot
+ps_rel <- transform_sample_counts(ps_ds_v, function(x) 100 * x / sum(x))
+ps_genus_rel <- tax_glom(ps_rel, taxrank = "Genus", NArm = TRUE)
+melted_genus <- psmelt(ps_genus_rel)
+
+abundance_stats <- melted_genus %>%
+  dplyr::group_by(Variety, Genus) %>%
+  dplyr::summarise(MeanAbundance = mean(Abundance), .groups = "drop")
+
+# 2. Merge DESeq2 results with Abundance stats ---------------------------------
+# We aggregate ASV results to Genus level for the plot
+plot_deseq_df <- final_deseq_var_df %>%
+  dplyr::group_by(Variety, Genus) %>%
+  dplyr::summarise(log2FoldChange = mean(log2FoldChange), # Mean effect size per genus
+                   pvalue = min(pvalue),                 # Best p-value per genus
+                   .groups = "drop") %>%
+  left_join(abundance_stats, by = c("Variety", "Genus"))
+
+# 3. Final Plotting ------------------------------------------------------------
+plot_deseq_df <- plot_deseq_df %>%
+  dplyr::filter(!is.na(Genus)) %>%
+  mutate(Genus = reorder(Genus, log2FoldChange))
+
+p_deseq_var <- ggplot(plot_deseq_df, aes(x = log2FoldChange, y = Genus, color = Variety)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(aes(size = MeanAbundance), alpha = 0.7) +
+  
+  # Use your defined variety colors
+  scale_color_manual(values = colors_Variety) + 
+  scale_size_continuous(name = "Mean Rel. Abundance (%)", range = c(2, 8)) +
+  
+  labs(
+    title = "Differentially Abundant Genera per Variety (DESeq2)",
+    subtitle = "Points represent nominal significance (unadjusted p < 0.05)",
+    x = "log2FoldChange (Inoculated / Control)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 0.5)
+  )
+
+print(p_deseq_var)
+
+# Save the plot
+ggsave(file.path(output_dir_fig_ITS, "Fig6_DESeq2_Variety_Specific_BubblePlot.svg"), 
+       plot = p_deseq_var, width = 10, height = 7)
+```
+
+
+#Supplementary figures
+# --- FIG S1: RAREFACTION CURVES ---
+```{r}
+RCall <- ggrare(psITS_Root, step = 100, se = FALSE, color = "Variety") + 
+  labs(title = "Rarefaction curve ITS, depending on the variety (no_norm)", 
+       x = "Depth",
+       y = "Number of ASVs") +
+  theme_minimal(base_size = 15) + 
+    scale_color_manual(values = c("Leak" = "#7CAE00", "PhkarRumduol" = "#00BFC4", "PhkarMalis"="#FF3B0A","Russey"="#FFC000", "IR64"="#9E1FFF")) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 12)) +
+  coord_cartesian(xlim = c(0, 35000))
+print(RCall)
+
+# Saving..
+ggsave(filename = file.path(output_dir_fig_ITS, "Rarefaction_curve_ITS_variety_Root_noPGM_nonorm.jpg"),
+       plot = RCall, width = 10, height = 7, dpi = 300)
+
+
+
+psITS_Root_rare <- rarefy_even_depth(psITS_Root, rngseed = 123,  sample.size = min(sample_sums(psITS_Root)),replace = FALSE, verbose = TRUE)
+psITS_Root_rare
+
+RCall <- ggrare(psITS_Root_rare, step = 100, se = FALSE, color = "Variety") + 
+  labs(title = "Rarefaction curve ITS, depending on the variety (rare)", 
+       x = "Depth",
+       y = "Number of ASVs") +
+  theme_minimal(base_size = 15) + 
+    scale_color_manual(values = c("Leak" = "#7CAE00", "PhkarRumduol" = "#00BFC4", "PhkarMalis"="#FF3B0A","Russey"="#FFC000", "IR64"="#9E1FFF")) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 12)) +
+  coord_cartesian(xlim = c(0, 25000))
+print(RCall)
+
+# Enregistrer le graphique
+ggsave(filename = file.path(output_dir_fig_ITS, "FigS1_Rarefaction_curve_ITS_variety_Root_noPGM_rare.jpg"),
+       plot = RCall, width = 10, height = 7, dpi = 300)
+```
+
+
+
+
+
+# --- FIG S4: PHENOTYPE ---
+```{r}
+# ==============================================================================
+# PHENOTYPIC DATA ANALYSIS
+# ==============================================================================
+
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(multcompView) # Required for significance letters
+
+# 1. Data Extraction & Setup ---------------------------------------------------
+# Extract metadata from the phyloseq object to ensure consistency
+pheno_df <- data.frame(sample_data(psITS_Root_10_rare))
+
+# Ensure columns are numeric
+pheno_df$Symptoms_up <- as.numeric(pheno_df$Symptoms_up)
+pheno_df$Size <- as.numeric(pheno_df$Size)
+
+# Define Palette
+colors_Variety <- c("Leak" = "#7CAE00", "PhkarRumduol" = "#00BFC4", 
+                    "PhkarMalis" = "#FF3B0A", "Russey" = "#FFC000", "IR64" = "#9E1FFF")
+
+# ------------------------------------------------------------------------------
+# FUNCTION: Generate Significance Letters (Kruskal + Pairwise Wilcoxon)
+# ------------------------------------------------------------------------------
+get_significance_letters <- function(data, value_col, group_col) {
+  # 1. Pairwise Wilcoxon Test (Non-parametric) with BH adjustment
+  pwc <- pairwise.wilcox.test(data[[value_col]], data[[group_col]],
+                              p.adjust.method = "BH")
+  
+  # 2. Convert p-values to a matrix for multcompView
+  p_mat <- pwc$p.value
+  
+  # Handles cases where the matrix is not square (required for multcompLetters)
+  # We convert the triangular output to a full matrix/list format if needed
+  # Using a helper logic for multcompLetters:
+  
+  # Format p-values into a named vector for multcompLetters
+  # Create a logical vector: TRUE if p < 0.05
+  # Note: multcompLetters is tricky with pairwise.wilcox output.
+  # We will use a robust method: compare everything to everything manually for the input string.
+  
+  # Alternative: Use "tri.to.squ" logic or simply loop.
+  # Let's use the matrix directly if compatible, or reconstruct names.
+  
+  # Simplified approach using multcompLetters directly on p-matrix usually requires full matrix.
+  # To avoid errors, we calculate letters based on the p-value matrix:
+  
+  # If p_mat contains NA, replace with 1 (self-comparison) or handle.
+  # Actually, let's use a try-catch standard loop to generate the comparison vector.
+  
+  # Convert triangular p-matrix to a list of comparisons "A-B" = p.val
+  p_vec <- c()
+  rn <- rownames(p_mat)
+  cn <- colnames(p_mat)
+  
+  for(r in rn) {
+    for(c in cn) {
+      if(!is.na(p_mat[r, c])) {
+        comp_name <- paste(r, c, sep = "-")
+        p_vec[comp_name] <- p_mat[r, c]
+      }
+    }
+  }
+  
+  # Generate letters
+  letters_list <- multcompLetters(p_vec, compare = "<", threshold = 0.05, Letters = letters)
+  
+  # Create a dataframe for plotting
+  res_df <- data.frame(
+    Variety = names(letters_list$Letters),
+    Letter = letters_list$Letters
+  )
+  return(res_df)
+}
+
+# ==============================================================================
+# FIGURE A: SYMPTOMS (Inoculated Plants Only)
+# ==============================================================================
+
+# 1. Subset Data
+df_symp <- pheno_df %>% 
+  filter(Condition == "Inoculated") %>%
+  filter(!is.na(Symptoms_up))
+
+# 2. Calculate Statistics (Letters)
+letters_symp <- get_significance_letters(df_symp, "Symptoms_up", "Variety")
+
+# 3. Calculate Y position for letters (Max value + 10% buffer)
+max_vals_symp <- df_symp %>% 
+  group_by(Variety) %>% 
+  summarise(MaxY = max(Symptoms_up, na.rm=TRUE)) %>%
+  left_join(letters_symp, by = "Variety")
+
+# 4. Plot
+p_symptoms <- ggplot(df_symp, aes(x = Variety, y = Symptoms_up, fill = Variety)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1.5) +
+  
+  # Add Letters
+  geom_text(data = max_vals_symp, aes(x = Variety, y = MaxY, label = Letter), 
+            vjust = -0.5, size = 5, fontface = "bold", inherit.aes = FALSE) +
+  
+  scale_fill_manual(values = colors_Variety) +
+  labs(title = "Symptom Severity (Inoculated Plants)",
+       y = "Lesion Length (cm)",
+       x = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  # Add margin at top for letters
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+
+print(p_symptoms)
+ggsave(file.path(output_dir_fig_ITS, "FigS4_Boxplot_Symptoms_Inoculated.svg"), p_symptoms, width = 6, height = 5)
+
+# ==============================================================================
+# FIGURE B: PLANT SIZE (Control/Healthy Plants Only)
+# ==============================================================================
+
+# 1. Subset Data
+df_size <- pheno_df %>% 
+  filter(Condition == "Control") %>%
+  filter(!is.na(Size))
+
+# 2. Calculate Statistics (Letters)
+letters_size <- get_significance_letters(df_size, "Size", "Variety")
+
+# 3. Calculate Y position for letters
+max_vals_size <- df_size %>% 
+  group_by(Variety) %>% 
+  summarise(MaxY = max(Size, na.rm=TRUE)) %>%
+  left_join(letters_size, by = "Variety")
+
+# 4. Plot
+p_size <- ggplot(df_size, aes(x = Variety, y = Size, fill = Variety)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1.5) +
+  
+  # Add Letters
+  geom_text(data = max_vals_size, aes(x = Variety, y = MaxY, label = Letter), 
+            vjust = -0.5, size = 5, fontface = "bold", inherit.aes = FALSE) +
+  
+  scale_fill_manual(values = colors_Variety) +
+  labs(title = "Plant Growth (Healthy/Control Plants)",
+       y = "Plant Height (cm)",
+       x = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+
+print(p_size)
+ggsave(file.path(output_dir_fig_ITS, "FigS4_Boxplot_Size_Control.svg"), p_size, width = 6, height = 5)
+```
+
+
+#PERMANOVA
+```{r}
+library(vegan)
+
+# 1. Prepare the distance matrix (Bray-Curtis)
+# Ensure the OTU table is correctly oriented (samples in rows)
+otu_table_matrix <- as.matrix(otu_table(psITS_Root_10_rare))
+bray_dist <- vegdist(otu_table_matrix, method = "bray")
+
+# 2. Extract metadata
+sample_metadata <- data.frame(sample_data(psITS_Root_10_rare))
+
+# 3. Global PERMANOVA: Testing the effects of Variety, Condition, and their Interaction
+# This is usually the main table presented in a publication
+permanova_global <- adonis2(
+  bray_dist ~ Variety * Condition,
+  data = sample_metadata,
+  permutations = 999,
+  method = "bray")
+
+# Print results to console
+print("Global PERMANOVA Results:")
+print(permanova_global)
+
+# Export Global PERMANOVA results
+write.csv(as.data.frame(permanova_global), 
+          file = file.path(output_dir_fig, "Table1_Global_PERMANOVA_Variety_Condition_ITS.csv"))
+```
+
+```{r}
+# Note: Ensure symptoms data is merged in the metadata as done in the previous sections
+# Testing if Symptoms_up significantly explains microbiota variance across varieties
+permanova_symptoms <- adonis2(
+  bray_dist ~ Symptoms_up + Variety,
+  data = sample_metadata, # Using the same metadata containing symptoms
+  permutations = 999,
+  method = "bray",
+  na.action = na.omit # Handles samples without symptom data
+)
+
+print("PERMANOVA Results (Symptoms + Variety):")
+print(permanova_symptoms)
+
+# Export results
+write.csv(as.data.frame(permanova_symptoms), 
+          file = file.path(output_dir_fig, "Table1_PERMANOVA_Symptoms_Variety_ITS.csv"))
+```
+
+
+#END

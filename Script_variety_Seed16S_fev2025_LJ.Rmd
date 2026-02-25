@@ -1,0 +1,836 @@
+# ==============================================================================
+# SCRIPT: Impact of Rice Variety and Inoculation on Seed Microbiota (16S)
+# [SUPPLEMENTARY ANALYSES]
+# AUTHOR: Léa Jobert (Modified for harmonization)
+# DATE: February 2026
+# ==============================================================================
+
+# 1. LOAD LIBRARIES ------------------------------------------------------------
+```{r message=FALSE, warning=FALSE}
+library(dada2)
+library(phyloseq)
+library(microViz)
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(vegan)
+library(tidyverse)
+library(patchwork)
+library(microbiomeutilities)
+library(pairwiseAdonis)
+library(RColorBrewer)
+library(decontam)
+library(ranacapa)
+library(scales)
+library(ggVennDiagram)
+library(openxlsx)
+library(forcats)
+```
+
+
+# 2. FILE PATHS & DIRECTORIES 
+```{r}
+# --- INPUT PATHS (Keep original Seed paths to load data) ---
+input_seed_path <- "input_path"
+
+# --- OUTPUT PATHS (Redirect to Root/Code 1 folder for publication consistency) ---
+# Base path from Code 1
+base_path_publication <- "output_path"
+
+# Create specific output directory for Supplementary Figures (Seeds)
+output_dir_fig <- file.path(base_path_publication, "Supplementary_Figures_Seed")
+if(!dir.exists(output_dir_fig)) dir.create(output_dir_fig)
+
+message("Input data will be read from: ", input_seed_path)
+message("Figures will be saved to: ", output_dir_fig)
+```
+
+# 3. DATA IMPORT & PHYLOSEQ CREATION 
+```{r}
+# 3.1 Import Data
+file_path_csv <- file.path(input_seed_path, "input_file.csv")
+df <- read.csv(file_path_csv, sep=";", header=TRUE, stringsAsFactors=FALSE)
+
+# 3.2 Prepare Taxonomy
+taxa <- df[, c("ASV", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")]
+rownames(taxa) <- taxa$ASV
+taxa$ASV <- NULL
+
+# 3.3 Prepare ASV Table
+asv <- df[, setdiff(names(df), c("taxonomy", "ASV", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))]
+rownames(asv) <- asv$ID
+asv$ID <- NULL
+asv <- t(asv) # Transpose: Samples as rows, ASVs as columns
+colnames(asv) <- df$ASV
+
+# 3.4 Import Metadata
+metadata <- read.csv2(file.path(input_seed_path, "Seed_metadata.csv"))
+
+# 3.5 Consistency Check & Merge
+common_samples <- intersect(rownames(asv), metadata$SampleID)
+asv <- asv[common_samples, ]
+metadata <- metadata[metadata$SampleID %in% common_samples, ]
+rownames(metadata) <- metadata$SampleID
+
+# Keep relevant columns
+keep.cols <- c("SampleID", "Compartment", "Variety", "Condition", "Group")
+metadata <- metadata[, keep.cols]
+
+# Convert ASV table to numeric matrix
+asv <- apply(asv, 2, as.numeric)
+rownames(asv) <- common_samples
+
+# 3.6 Create Phyloseq Object
+ps16S_1 <- phyloseq(otu_table(asv, taxa_are_rows=FALSE), 
+                    sample_data(metadata), 
+                    tax_table(as.matrix(taxa)))
+
+ps16S_1 # Check initial dimensions
+```
+
+
+# 4. DATA FILTERING 
+```{r}
+# 4.1 Taxonomic Filtering
+# Remove non-bacterial/archaeal sequences (Viridiplantae)
+ps16S <- ps16S_1 %>% subset_taxa(Kingdom != "k__Viridiplantae") 
+
+# Remove NA at Kingdom and Phylum levels
+ps16S <- subset_taxa(ps16S, !is.na(Kingdom) & !is.na(Phylum))
+
+# Remove Mitochondria and Chloroplast
+ps16S <- ps16S %>% subset_taxa(Family != "Mitochondria" & Class != "Chloroplast")
+
+# 4.2 Sample Filtering (Seeds only)
+ps16S_Seed <- subset_samples(ps16S, Compartment == "Seed")
+
+# 4.3 Variety Filtering (Specific to Seed Study)
+# Removing IR64 and PhkarRumduol_GM as requested in original seed code
+ps16S_Seed_Clean <- subset_samples(ps16S_Seed, Variety != "IR64" & Variety != "PhkarRumduol_GM")
+
+# 4.4 Low Abundance Filtering
+# Remove taxa with total count < 10 in the subset
+ps16S_Seed_10 <- phyloseq::filter_taxa(
+  ps16S_Seed_Clean,
+  function(x) sum(x) >= 10,
+  prune = TRUE
+)
+
+ps16S_Seed_10 # Check final dimensions
+```
+
+
+# 5. NORMALIZATION
+```{r}
+# Rarefaction (Matching Code 1 methodology)
+# Using seed 123 for reproducibility
+ps16S_Seed_rare <- rarefy_even_depth(
+  ps16S_Seed_10, 
+  rngseed = 123, 
+  sample.size = min(sample_sums(ps16S_Seed_10)),
+  replace = FALSE,
+  verbose = TRUE
+)
+```
+```{r}
+colors_Variety <- c("Leak" = "#7CAE00", 
+                    "PhkarRumduol" = "#00BFC4", 
+                    "PhkarMalis"="#FF3B0A",
+                    "Russey"="#FFC000", 
+                    "IR64"="#9E1FFF")
+
+# Palette for Venn Diagrams
+color_venn  <- c(low = "#F2EBBBFF", high = "#7F1019")
+```
+
+# 6. ANALYSIS & FIGURES --------------------------------------------------------
+
+# --- FIG 1: TAXONOMIC HEATMAP SEED (Top 30 Species) ---
+```{r}
+
+library(phyloseq)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+
+# --- 1. Agglomerate at Species Level ---
+ps_species <- tax_glom(ps16S_Seed_10, taxrank = "Species", NArm = FALSE)
+
+# --- 2. Transform to Relative Abundance (%) ---
+ps_species_rel <- transform_sample_counts(ps_species, function(x) x / sum(x) * 100)
+
+# --- 3. Convert to Data Frame ---
+df_ps_species <- psmelt(ps_species_rel) 
+
+# --- 4. CLEAN NAMES (Sp. and Spaces) ---
+# This is the new part for proper formatting
+df_ps_species <- df_ps_species %>%
+  mutate(
+    # Clean Species column: if NA or string "NA", replace with "sp."
+    Species_Clean = ifelse(is.na(Species) | Species == "NA" | Species == "", "sp.", Species),
+    # Create Genus Species label with a SPACE, not underscore
+    Genus_Species = paste(Genus, Species_Clean, sep = " ")
+  )
+
+# --- Data Aggregation and Global Ranking ---
+
+# 1. Calculate mean relative abundance per variety for each species
+mean_abundance_per_variety <- df_ps_species %>%
+  group_by(Variety, Genus_Species) %>%
+  summarise(MeanAbundance = mean(Abundance), .groups = "drop")
+
+# 2. Identify the Top 30 species based on cumulative abundance across all varieties
+# (Sum of means across the 4 varieties)
+top30_global_list <- mean_abundance_per_variety %>%
+  group_by(Genus_Species) %>%
+  summarise(TotalAbundance = sum(MeanAbundance)) %>%
+  arrange(desc(TotalAbundance)) %>%  # Sort highest to lowest
+  slice_head(n = 30)                 # Select top 30
+
+# 3. Filter dataset to keep only the Top 30 and pivot to wide format
+top30_wide <- mean_abundance_per_variety %>%
+  filter(Genus_Species %in% top30_global_list$Genus_Species) %>%
+  pivot_wider(names_from = Variety, values_from = MeanAbundance, values_fill = 0) %>%
+  # Crucial: Reorder rows to match the global ranking (Descending Total Abundance)
+  arrange(match(Genus_Species, top30_global_list$Genus_Species))
+
+# --- 7. Save to Excel ---
+excel_output_file <- file.path(output_dir_fig, "Table_Top30_Species_by_Variety_Seed_16S.xlsx")
+write.xlsx(top30_wide, file = excel_output_file)
+
+message("✅ Excel file created with clean names: ", excel_output_file)
+
+
+
+# ==============================================================================
+# FIG 1 SEED
+# ==============================================================================
+library(readxl)
+library(tibble)
+library(ComplexHeatmap)
+library(circlize)
+
+# --- 1. Load Data ---
+df_seed <- read_xlsx(excel_output_file)
+
+# --- 2. Format Data ---
+df_matrix <- df_seed %>%
+  column_to_rownames("Genus_Species") %>%
+  as.matrix()
+
+# --- 3. Annotations ---
+annotation_df <- data.frame(Variety = colnames(df_matrix))
+rownames(annotation_df) <- colnames(df_matrix)
+ann_colors <- list(Variety = colors_Variety)
+
+# --- 4. Colors ---
+col_fun_seed <- colorRamp2(
+  c(0, 1, 2, 5, 10, 20, 50, 75, 100),
+  c("white", "#FEDBC3", "#FDC29B", "#FCAA73", "#FB8537", "#FA6D0F", "#DC5B04", "#B44A04", "#8C3A03")
+)
+
+# --- 5. Generate Heatmap ---
+heatmap_seed <- Heatmap(
+  df_matrix,
+  name = "Abundance (%)",
+  
+  # Clustering
+  cluster_rows = TRUE,        
+  cluster_columns = FALSE,    
+  column_order = colnames(df_matrix), 
+  
+  # Hiding the tree (Dendrogram)
+  show_row_dend = FALSE,      # <--- This removes the tree on the left
+  
+  # Sizing (Making cells more square)
+  # We force the width of the heatmap body to be narrow (e.g., 5cm for 4 columns)
+  width = unit(5, "cm"),      # <--- Adjust this to change cell width
+  
+  # Annotations
+  top_annotation = HeatmapAnnotation(df = annotation_df, col = ann_colors),
+  
+  # Colors
+  col = col_fun_seed,
+  
+  # Typography (Italics and Sizes)
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 10, fontface = "italic"), # <--- Italics here
+  column_names_gp = gpar(fontsize = 10, fontface = "bold"),
+  
+  # Borders
+  rect_gp = gpar(col = "white", lwd = 1) 
+)
+
+# --- 6. Draw and Save ---
+svg_file <- file.path(output_dir_fig, "FIG1_Heatmap_Top30_Seed_Final_16S.svg")
+
+# Adjusted output size to fit the vertical list
+svg(svg_file, width = 6, height = 8) 
+draw(heatmap_seed)
+dev.off()
+
+message("✅ Final Heatmap saved to: ", svg_file)
+```
+
+
+## Supp. Fig 1
+```{r}
+# Note: Using ranacapa::ggrare or similar logic
+p_rare <- ggrare(ps16S_Seed_Clean, step = 100, se = FALSE, color = "Variety") + 
+  labs(title = "Supplementary Figure 1. Rarefaction curve (Seeds)", 
+       x = "Sequencing Depth",
+       y = "Number of ASVs") +
+  scale_color_manual(values = colors_Variety) +
+  theme_minimal(base_size = 14) + 
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = "right"
+  ) +
+  coord_cartesian(xlim = c(0, 25000))
+
+print(p_rare)
+
+ggsave(filename = file.path(output_dir_fig, "SuppFig1_Rarefaction_Seed_16S.svg"),
+       plot = p_rare, width = 8, height = 6)
+```
+
+## Supp. Fig 2A
+```{r}
+## Supp. Fig 2A: Alpha Diversity (Richness) - Corrected Stats & Plot
+library(multcompView)
+library(dplyr)
+library(ggplot2)
+
+# 1. Prepare Data
+alpha_div <- estimate_richness(ps16S_Seed_10, measures = c("Observed", "Shannon"))
+alpha_data <- cbind(as.data.frame(sample_data(ps16S_Seed_10)), alpha_div)
+
+# Ensure Variety is a factor
+alpha_data$Variety <- as.factor(alpha_data$Variety)
+
+# ------------------------------------------------------------------------------
+# 2. STATISTICAL CALCULATIONS (Pairwise Wilcoxon)
+# ------------------------------------------------------------------------------
+
+# A. Global Kruskal-Wallis
+kw_test <- kruskal.test(Observed ~ Variety, data = alpha_data)
+kw_pval <- signif(kw_test$p.value, 3)
+
+# B. Pairwise Wilcoxon Test (with FDR correction)
+# This generates a triangular matrix of p-values
+pairwise_res <- pairwise.wilcox.test(alpha_data$Observed, alpha_data$Variety, p.adjust.method = "none")
+
+# ------------------------------------------------------------------------------
+# 3. GENERATE TABLE OF RESULTS (Le tableau que tu as demandé)
+# ------------------------------------------------------------------------------
+
+# Convert the triangular matrix into a flat table (A vs B)
+p_matrix <- pairwise_res$p.value
+
+# Transform matrix to table
+stats_table <- as.data.frame(as.table(p_matrix))
+names(stats_table) <- c("Variety_A", "Variety_B", "p_adj")
+
+# Filter out NAs (diagonal and duplicates) and sort
+stats_table <- stats_table %>%
+  filter(!is.na(p_adj)) %>%
+  arrange(p_adj) %>%
+  mutate(Significance = case_when(
+    p_adj < 0.001 ~ "***",
+    p_adj < 0.01  ~ "**",
+    p_adj < 0.05  ~ "*",
+    TRUE          ~ "ns"
+  ))
+
+# Print the table to console
+print("--- Tableau des Stats Wilcoxon (Pairwise FDR) ---")
+print(stats_table)
+
+# Export the table to CSV
+write.csv(stats_table, file.path(output_dir_fig, "SuppFig2A_Wilcoxon_Stats_Table_16S.csv"), row.names = FALSE)
+
+
+# ------------------------------------------------------------------------------
+# 4. GENERATE LETTERS FOR PLOT
+# ------------------------------------------------------------------------------
+
+# Function to convert p-value matrix to Letters
+# We need to handle the NA values in the triangular matrix for multcompLetters
+p_matrix_full <- p_matrix
+
+# Replace NA with 1 (or 0 if on diagonal, but for letters 1 is safer for 'no difference')
+p_matrix_full[is.na(p_matrix_full)] <- 1 
+
+# multcompLetters needs a symmetric matrix or a specific vector format.
+# Let's try passing the flattened vector with names, which is often more robust.
+p_vec <- stats_table$p_adj
+names(p_vec) <- paste(stats_table$Variety_A, stats_table$Variety_B, sep="-")
+
+# Generate letters
+letters_list <- multcompLetters(p_vec, compare="<", threshold=0.05, Letters=letters)
+
+# Create a dataframe for plotting
+letters_df <- data.frame(
+  Variety = names(letters_list$Letters),
+  Letter = letters_list$Letters
+)
+
+# Add Y position (Max observed value + 10% padding)
+max_vals <- alpha_data %>%
+  group_by(Variety) %>%
+  summarise(MaxVal = max(Observed))
+
+letters_df <- merge(letters_df, max_vals, by = "Variety")
+letters_df$Y_pos <- letters_df$MaxVal * 1.05 # Position slightly above max
+
+print("--- Lettres attribuées ---")
+print(letters_df)
+
+# ------------------------------------------------------------------------------
+# 5. PLOT
+# ------------------------------------------------------------------------------
+
+p_alpha <- ggplot(alpha_data, aes(x = Variety, y = Observed, fill = Variety)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(color = "black", size = 2, alpha = 0.5, width = 0.1) +
+  scale_fill_manual(values = colors_Variety) +
+  
+  # Title and Stats Info
+  labs(title = "Supplementary Figure 2A. Observed ASV Richness (Seeds)", 
+       y = "Number of ASVs",
+       subtitle = paste("Global Kruskal-Wallis p =", kw_pval)) +
+  
+  # Add Letters
+  geom_text(data = letters_df, aes(x = Variety, y = Y_pos, label = Letter), 
+            size = 6, color = "black", fontface = "bold", inherit.aes = FALSE) +
+  
+  theme_minimal(base_size = 14) + 
+  theme(
+    axis.title.x = element_blank(),
+    plot.title = element_text(face="bold"),
+    legend.position = "right"
+  ) +
+  # Extend Y axis to make room for letters
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+
+print(p_alpha)
+
+ggsave(file.path(output_dir_fig, "SuppFig2A_Alpha_Richness_Seed_Letters_16S.svg"), 
+       p_alpha, width = 7, height = 5)
+```
+
+
+
+## Supp. Fig 2B
+```{r}
+# 1. Calculate Bray-Curtis and NMDS
+bray_dist_seed <- phyloseq::distance(ps16S_Seed_rare, method = "bray")
+nmds_seed <- ordinate(ps16S_Seed_rare, method = "NMDS", distance = "bray")
+
+# 2. PERMANOVA
+seed_metadata <- as.data.frame(as.matrix(sample_data(ps16S_Seed_rare)))
+adonis_seed <- adonis2(bray_dist_seed ~ Variety, data = seed_metadata)
+
+# 3. Extract Stats
+r2_val     <- round(adonis_seed$R2[1], 3)
+p_val      <- adonis_seed$`Pr(>F)`[1]
+stress_val <- round(nmds_seed$stress, 3)
+
+# 4. Plot
+p_nmds <- plot_ordination(ps16S_Seed_rare, nmds_seed, color = "Variety") +
+  geom_point(size = 4, alpha = 0.7) +
+  stat_ellipse(aes(fill = Variety), geom = "polygon", alpha = 0.1, color = NA) +
+  scale_color_manual(values = colors_Variety) +
+  scale_fill_manual(values = colors_Variety) +
+  labs(
+    title = "Supplementary Figure 2B. NMDS - Seed Microbiota", 
+    subtitle = paste0("Bray-Curtis | R² = ", r2_val, " | p = ", p_val, " | Stress = ", stress_val)
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(face = "italic", size = 11),
+    legend.title = element_text(face = "bold")
+  )
+
+print(p_nmds)
+
+ggsave(file.path(output_dir_fig, "SuppFig2B_NMDS_Seed_16S.svg"), p_nmds, width = 7, height = 5)
+```
+
+
+## Supp. Fig 2C
+```{r}
+
+library(vegan)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+# 1. PREPARE DATA
+# We need the rarefied object for Beta diversity
+meta_seed <- data.frame(sample_data(ps16S_Seed_rare))
+meta_seed$SampleID <- rownames(meta_seed)
+meta_seed <- meta_seed %>% dplyr::select(SampleID, Variety)
+
+# Ensure factor levels match the color palette order
+lvl <- intersect(names(colors_Variety), unique(meta_seed$Variety))
+meta_seed$Variety <- factor(meta_seed$Variety, levels = lvl)
+
+# Calculate Distance Matrix (Bray-Curtis)
+otu_mat <- as.matrix(otu_table(ps16S_Seed_rare))
+bray_dist <- phyloseq::distance(ps16S_Seed_rare, method = "bray")
+bray_mat <- as.matrix(bray_dist)
+
+# ------------------------------------------------------------------------------
+# 2. STATISTICAL CALCULATIONS: PAIRWISE PERMANOVA
+# ------------------------------------------------------------------------------
+# We loop through every pair of varieties and run adonis2
+
+# Get all unique pairs
+variety_levels <- levels(meta_seed$Variety)
+pairs_comb <- combn(variety_levels, 2, simplify = FALSE)
+
+# Function to run PERMANOVA on a pair
+run_pairwise_permanova <- function(pair, metadata, dist_mat) {
+  # Subset metadata for the two varieties
+  sub_meta <- metadata %>% filter(Variety %in% pair)
+  samples_keep <- sub_meta$SampleID
+  
+  # Subset distance matrix
+  sub_dist <- as.dist(dist_mat[samples_keep, samples_keep])
+  
+  # Run PERMANOVA (999 permutations)
+  set.seed(123)
+  perm <- adonis2(sub_dist ~ Variety, data = sub_meta, permutations = 999)
+  
+  # Return results
+  data.frame(
+    Var1 = pair[1],
+    Var2 = pair[2],
+    R2 = perm$R2[1],
+    pval = perm$`Pr(>F)`[1]
+  )
+}
+
+# Execute the loop
+perm_results_list <- lapply(pairs_comb, run_pairwise_permanova, 
+                            metadata = meta_seed, dist_mat = bray_mat)
+
+# Combine into a dataframe
+perm_stats <- do.call(rbind, perm_results_list)
+
+# Apply P-value Correction (Benjamini-Hochberg / FDR)
+perm_stats$p_adj <- p.adjust(perm_stats$pval, method = "BH")
+
+# Create Significance Labels (Stars)
+perm_stats <- perm_stats %>%
+  mutate(stars = case_when(
+    p_adj < 0.001 ~ "***",
+    p_adj < 0.01  ~ "**",
+    p_adj < 0.05  ~ "*",
+    TRUE          ~ ""
+  ))
+
+print("--- Pairwise PERMANOVA Results ---")
+print(perm_stats)
+# Save table
+write.csv(perm_stats, file.path(output_dir_fig, "SuppFig2C_Permanova_Stats_16S.csv"), row.names = FALSE)
+
+
+# ------------------------------------------------------------------------------
+# 3. PREPARE PLOTTING DATA (Mean Distances)
+# ------------------------------------------------------------------------------
+
+# Create a long format dataframe of all sample pairs to calculate means
+pairs_df <- as.data.frame(t(combn(rownames(bray_mat), 2)), stringsAsFactors = FALSE)
+colnames(pairs_df) <- c("Sample1", "Sample2")
+
+# Add distances
+pairs_df$Distance <- bray_mat[cbind(match(pairs_df$Sample1, rownames(bray_mat)),
+                                    match(pairs_df$Sample2, colnames(bray_mat)))]
+
+# Add Metadata
+pairs_df <- pairs_df %>%
+  left_join(meta_seed, by = c("Sample1" = "SampleID")) %>% dplyr::rename(Var1 = Variety) %>%
+  left_join(meta_seed, by = c("Sample2" = "SampleID")) %>% dplyr::rename(Var2 = Variety)
+
+# Calculate Mean Distance per Variety Pair
+mean_dist_df <- pairs_df %>%
+  group_by(Var1, Var2) %>%
+  summarise(MeanDist = mean(Distance), .groups = "drop")
+
+# Create symmetric grid for Heatmap
+heatmap_df <- expand.grid(Var1 = lvl, Var2 = lvl) %>%
+  left_join(mean_dist_df, by = c("Var1", "Var2")) %>%
+  left_join(mean_dist_df, by = c("Var1" = "Var2", "Var2" = "Var1"), suffix = c("", "_rev")) %>%
+  mutate(MeanDist = coalesce(MeanDist, MeanDist_rev))
+
+# Merge the Stars into the heatmap data
+# We need to make sure direction (Var1 vs Var2) matches
+heatmap_df <- heatmap_df %>%
+  left_join(perm_stats %>% dplyr::select(Var1, Var2, stars), by = c("Var1", "Var2")) %>%
+  left_join(perm_stats %>% dplyr::select(Var1, Var2, stars), by = c("Var1" = "Var2", "Var2" = "Var1"), suffix = c("", "_rev")) %>%
+  mutate(stars = coalesce(stars, stars_rev))
+
+# Remove diagonal stars (self comparison)
+heatmap_df$stars[heatmap_df$Var1 == heatmap_df$Var2] <- ""
+
+# ------------------------------------------------------------------------------
+# 4. PLOTS
+# ------------------------------------------------------------------------------
+
+# A. DISPERSION (Betadisper) - Same as before
+bd <- betadisper(as.dist(bray_mat), meta_seed$Variety)
+disp_df <- data.frame(SampleID = names(bd$distances), Distance = bd$distances, Variety = bd$group)
+
+p_disp <- ggplot(disp_df, aes(x = Variety, y = Distance, fill = Variety)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.12, alpha = 0.4, size = 1.5) +
+  scale_fill_manual(values = colors_Variety) +
+  labs(title = "Dispersion", y = "Distance to Centroid", x = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 30, hjust = 1))
+
+# B. HEATMAP with STARS
+p_heat <- ggplot(heatmap_df, aes(x = Var1, y = Var2, fill = MeanDist)) +
+  geom_tile(color = "white") +
+  scale_fill_distiller(palette = "YlOrRd", name = "Mean Dist.", direction = 1) +
+  
+  # Add the stars!
+  geom_text(aes(label = stars), size = 6, vjust = 0.7) +
+  
+  labs(title = "Pairwise Dissimilarity & Stats", 
+       subtitle = "Stars: PERMANOVA FDR < 0.05 (*), < 0.01 (**), < 0.001 (***)",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine Plots
+combined_plot <- (p_disp | p_heat) + 
+  plot_annotation(title = "Supplementary Figure 2C. Beta Diversity Detail (Seeds)")
+
+print(combined_plot)
+
+ggsave(file.path(output_dir_fig, "SuppFig2C_Dispersion_Heatmap_Seed_WithStats_16S.svg"), 
+       combined_plot, width = 12, height = 6)
+```
+
+
+## Supp. Fig 3.A & C
+```{r}
+
+# --- 1. VENN DIAGRAM ---
+otu_controls <- as.data.frame(otu_table(ps16S_Seed_10)) # Using non-rarefied for presence/absence usually, or rarefied.
+# Note: Code 1 used 'ps16S_control_10' (non-rarefied) for Venn list generation logic usually
+metadata_controls <- as.data.frame(sample_data(ps16S_Seed_10))
+
+min_abundance <- 100 
+min_prev <- 0.8  # Code 1 uses 80%, Code 2 draft had 100%. Adjust here if needed.
+# Let's use Code 1 standard (0.8) for consistency unless strict core is required.
+
+varieties <- unique(metadata_controls$Variety)
+
+otu_listF <- lapply(varieties, function(var) {
+  samples <- rownames(metadata_controls[metadata_controls$Variety == var, ])
+  samples <- intersect(samples, rownames(otu_controls))
+  if (length(samples) == 0) return(character(0))
+  
+  otu_subset <- otu_controls[samples, , drop = FALSE]
+  
+  pass_abundance <- colSums(otu_subset) >= min_abundance
+  pass_prevalence <- (colSums(otu_subset > 0) / nrow(otu_subset)) >= min_prev
+  
+  return(colnames(otu_subset)[pass_abundance & pass_prevalence])
+})
+names(otu_listF) <- varieties
+
+# Venn Plot
+colors_ordered <- colors_Variety[names(otu_listF)]
+
+venn <- ggVennDiagram(otu_listF, 
+                      set_color = colors_ordered,    
+                      set_size = 5,                  
+                      label = "count",               
+                      label_alpha = 0) +             
+  scale_fill_gradient(low = color_venn["low"], high = color_venn["high"], name = "ASV Count") +
+  labs(title = "Supplementary Figure 3A. Core Microbiota (Seeds)") +
+  theme(legend.position = "right")
+
+print(venn)
+ggsave(file.path(output_dir_fig, "SuppFig3A_Venn_Core_Seed_16S.svg"), venn, width = 8, height = 6)
+
+
+# --- 2. DONUT CHART (Genus) ---
+# Identify Core ASVs
+core_asvs <- Reduce(intersect, otu_listF)
+
+# Prepare Data using Rarefied object for relative abundance
+tax_df <- as.data.frame(tax_table(ps16S_Seed_rare))
+tax_df$ASV <- rownames(tax_df)
+
+otu_mat_rare <- as.data.frame(otu_table(ps16S_Seed_rare))
+otu_core_subset <- otu_mat_rare[, colnames(otu_mat_rare) %in% core_asvs, drop=FALSE]
+core_abundance_vec <- colSums(otu_core_subset)
+
+core_tax_df <- data.frame(ASV = names(core_abundance_vec), Abundance = as.numeric(core_abundance_vec)) %>%
+  left_join(tax_df, by = "ASV")
+
+rank_to_show <- "Genus"
+min_pct_other <- 2 
+
+core_summary <- core_tax_df %>%
+  filter(!is.na(.data[[rank_to_show]]), .data[[rank_to_show]] != "Unclassified") %>% 
+  group_by(.data[[rank_to_show]]) %>%
+  summarise(TotalAbundance = sum(Abundance), .groups = "drop") %>%
+  mutate(pct = 100 * TotalAbundance / sum(TotalAbundance)) %>%
+  mutate(DisplayGroup = ifelse(pct < min_pct_other, "Other", .data[[rank_to_show]])) %>%
+  group_by(DisplayGroup) %>%
+  summarise(TotalAbundance = sum(TotalAbundance), .groups = "drop") %>%
+  mutate(pct = round(100 * TotalAbundance / sum(TotalAbundance), 1)) %>%
+  arrange(desc(pct))
+
+# Colors
+lvls <- core_summary$DisplayGroup
+pal_vec <- colorRampPalette(brewer.pal(12, "Set3"))(length(lvls))
+names(pal_vec) <- lvls
+if("Other" %in% names(pal_vec)) pal_vec["Other"] <- "grey80"
+
+# Donut Plot
+donut_core <- ggplot(core_summary, aes(x = 2, y = pct, fill = fct_reorder(DisplayGroup, pct))) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  xlim(0.5, 2.5) +
+  theme_void() +
+  geom_text(aes(label = paste0(DisplayGroup, " (", pct, "%)")),
+            position = position_stack(vjust = 0.5), size = 3.5) +
+  scale_fill_manual(values = pal_vec, name = rank_to_show) +
+  labs(title = "Supplementary Figure 3B. Core Composition (Genus)",
+       subtitle = paste0("Core comprises ", length(core_asvs), " ASVs"))
+
+print(donut_core)
+ggsave(file.path(output_dir_fig, "SuppFig3C_Core_Donut_Seed_16S.svg"), donut_core, width = 8, height = 6)
+
+## Supp. Fig 3C/bis: Core Microbiota Composition - FAMILY Level (Seeds)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(forcats)
+
+# 1. PARAMETERS
+rank_to_show <- "Genus"   # Ce qu'on écrit (Label)
+rank_parent <- "Family"   # La couleur (Fill)
+min_pct_other <- 2        # Seuil pour grouper en "Other"
+min_pct_label <- 2        # Seuil pour afficher le texte
+
+# 2. DATA PREPARATION (Using Seed Data)
+# Extract tax and otu tables from the rarefied object
+tax_df <- as.data.frame(tax_table(ps16S_Seed_rare))
+tax_df$ASV <- rownames(tax_df)
+
+otu_mat <- as.data.frame(otu_table(ps16S_Seed_rare))
+
+# Filter only Core ASVs (must be defined previously via Venn diagram step)
+if(!exists("core_asvs")) stop("Error: core_asvs not found. Run Venn diagram code first.")
+otu_core <- otu_mat[, colnames(otu_mat) %in% core_asvs, drop = FALSE]
+core_abundance <- colSums(otu_core)
+
+# Create merged Dataframe
+df_core <- data.frame(ASV = names(core_abundance), Abundance = core_abundance) %>%
+  left_join(tax_df, by = "ASV")
+
+# 3. AGGREGATION LOGIC (Identical to Code 1)
+core_summary_fam <- df_core %>%
+  filter(!is.na(.data[[rank_to_show]]), 
+         .data[[rank_to_show]] != "Unclassified") %>%
+  # Group by Genus AND Family
+  group_by(.data[[rank_to_show]], .data[[rank_parent]]) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+  # Calculate Percentage
+  mutate(pct = 100 * Abundance / sum(Abundance)) %>%
+  # Rename small groups to "Other"
+  mutate(
+    Genus_Group = ifelse(pct < min_pct_other, "Other", .data[[rank_to_show]]),
+    Family_Group = ifelse(pct < min_pct_other, "Other", .data[[rank_parent]])
+  ) %>%
+  # Re-group by the new names
+  group_by(Genus_Group, Family_Group) %>%
+  summarise(pct = sum(pct), .groups = "drop") %>%
+  arrange(Family_Group, desc(pct))
+
+# 4. FACTOR ORDERING
+# Order Genus for stacking
+core_summary_fam$Genus_Group <- factor(core_summary_fam$Genus_Group, levels = unique(core_summary_fam$Genus_Group))
+
+# Order Family for Legend (Put "Other" at the end)
+levels_fam <- unique(core_summary_fam$Family_Group)
+levels_fam <- c(setdiff(levels_fam, "Other"), "Other")
+core_summary_fam$Family_Group <- factor(core_summary_fam$Family_Group, levels = levels_fam)
+
+# 5. CREATE LABELS (GENUS NAME)
+# This ensures the Label shows the Genus, even though the Color is Family
+core_summary_fam <- core_summary_fam %>%
+  mutate(Label = ifelse(pct >= min_pct_label, 
+                        paste0(Genus_Group, "\n(", round(pct, 1), "%)"), 
+                        ""))
+
+# 6. COLORS (Code 1 Palette + Dynamic handling for Seeds)
+family_colors_root <- c(
+  "Burkholderiaceae"      = "#FC7A57",  
+  "Comamonadaceae"        = "#28666E",  
+  "Rhizobiaceae"          = "#B5B682",  
+  "Xanthobacteraceae"     = "#B2DF8A",  
+  "Sphingomonadaceae"     = "#FCD757",  
+  "Beijerinckiaceae"      = "#FDBF6F",  
+  "Chitinophagaceae"      = "#574D68",  
+  "Solirubrobacteraceae"  = "#CAB2D6",  
+  "Solimonadaceae"        = "#94D1BE",  
+  "Holophagaceae"         = "#B15928",  
+  "Other"                 = "#D3D3D3"   
+)
+
+# Check for Seed families not in the Root palette
+present_families <- unique(as.character(core_summary_fam$Family_Group))
+missing_families <- setdiff(present_families, names(family_colors_root))
+
+if(length(missing_families) > 0) {
+  # Generate distinct colors for new families found in seeds
+  new_colors <- colorRampPalette(brewer.pal(8, "Dark2"))(length(missing_families))
+  names(new_colors) <- missing_families
+  # Combine with original palette
+  final_palette <- c(family_colors_root, new_colors)
+} else {
+  final_palette <- family_colors_root
+}
+# Ensure "Other" is always grey
+final_palette["Other"] <- "#D3D3D3"
+
+
+# 7. PLOT
+donut_core_fam <- ggplot(core_summary_fam, aes(x = 2, y = pct, fill = Family_Group)) +
+  geom_col(width = 1, color = "white", linewidth = 1) + 
+  coord_polar(theta = "y") +
+  xlim(0.5, 2.5) +
+  
+  # Text Labels: Showing Genus (from 'Label' column)
+  geom_text(aes(label = Label), position = position_stack(vjust = 0.5),
+            size = 3.5, fontface = "bold", color = "black") + 
+  
+  # Fill Colors: Based on Family
+  scale_fill_manual(values = final_palette, name = "Family") +
+  
+  theme_void() +
+  labs(title = "Supplementary Figure 3B. Core Microbiota (Seeds)",
+       subtitle = "Colors: Family | Labels: Genus") +
+  theme(legend.position = "right", legend.title = element_text(face="bold"))
+
+print(donut_core_fam)
+
+ggsave(file.path(output_dir_fig, "SuppFig3B_Core_Donut_Family_GenusLabel_Seed_16S.svg"),
+  donut_core_fam, width = 10, height = 7)
+
+
+```
+
+#END
